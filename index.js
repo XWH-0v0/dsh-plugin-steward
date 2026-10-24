@@ -169,9 +169,11 @@ export function apply(ctx) {
         }
       }
       const status = expected ? 409 : 500
+      const detail = truncate(messageOf(error), 600)
       sendJson(res, status, {
         error: error?.code || 'update-failed',
-        detail: truncate(messageOf(error), 600),
+        detail,
+        reason: detail,
       })
     } finally {
       updating = false
@@ -247,14 +249,21 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     : undefined
   const stages = []
   let failure = null
+  let deferredRemoval = false
+  let installAttempted = false
 
   try {
     const removed = await ctx.pluginManager.removeBundle(name)
     stages.push(stageOf('remove', removed))
-    if (!removalSucceeded(removed)) {
+    if (!removalAccepted(removed)) {
       throw updateProblem('remove-failed', changeReason(removed))
     }
+    // A running host module can be removed from the profile now but stay in
+    // memory until the next start. That is a deferred success, not a failure:
+    // continue installing the new version so the restart picks it up.
+    deferredRemoval = removed.application === 'restart-required'
 
+    installAttempted = true
     const installed = await ctx.pluginManager.installBundle(
       `${name}@${requestedVersion}`,
       installOptions(enabled, registry),
@@ -270,13 +279,17 @@ async function performUpdate(ctx, load, name, requestedVersion) {
       throw updateProblem('verify-failed', 'The installed version did not become the requested version.')
     }
 
+    const restartRequired = deferredRemoval || installed.application === 'restart-required'
     return {
-      status: installed.application === 'restart-required' ? 'restart-required' : 'updated',
+      status: restartRequired ? 'restart-required' : 'updated',
       name,
       fromVersion,
       toVersion: requestedVersion,
       enabled,
       registry: registry || null,
+      restartRequired,
+      restartReason: installed.restartReason || removed.restartReason,
+      deferredRemoval,
       overridden: installed.application === 'overridden',
       stages,
     }
@@ -284,13 +297,16 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     failure = error
   }
 
-  // A failed install can leave a selected bundle or downloaded package behind.
-  let cleanup = null
-  try {
-    cleanup = await ctx.pluginManager.removeBundle(name)
-    stages.push(stageOf('cleanup', cleanup))
-  } catch (error) {
-    stages.push({ stage: 'cleanup', error: truncate(messageOf(error), 600) })
+  // Only a failed install can have left a new version behind. If removal
+  // itself failed or was deferred, the package on disk is still the old one;
+  // skip cleanup and let rollback restore its selection.
+  if (installAttempted) {
+    try {
+      const cleanup = await ctx.pluginManager.removeBundle(name)
+      stages.push(stageOf('cleanup', cleanup))
+    } catch (error) {
+      stages.push({ stage: 'cleanup', error: truncate(messageOf(error), 600) })
+    }
   }
 
   let rollback = null
@@ -327,6 +343,7 @@ async function performUpdate(ctx, load, name, requestedVersion) {
       enabled,
       registry: registry || null,
       rollbackRestartRequired: rollback?.application === 'restart-required',
+      reason: failure?.message || 'The update failed.',
       failure: problemOf(failure),
       stages,
     }
@@ -339,8 +356,10 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     toVersion: requestedVersion,
     enabled,
     registry: registry || null,
+    reason: failure?.message || 'The update failed.',
     failure: problemOf(failure),
     rollbackError: truncate(rollbackError || 'The old version could not be reinstalled.', 600),
+    rollbackReason: truncate(rollbackError || 'The old version could not be reinstalled.', 600),
     stages,
   }
 }
@@ -357,10 +376,10 @@ function installOptions(enabled, registry) {
   return options
 }
 
-function removalSucceeded(change) {
+function removalAccepted(change) {
   return change?.changed === true
     && change?.error === undefined
-    && change?.application === 'applied'
+    && (change?.application === 'applied' || change?.application === 'restart-required')
 }
 
 function installSucceeded(change) {
@@ -399,6 +418,9 @@ function stageOf(stage, change) {
     application: typeof change?.application === 'string' ? change.application : null,
   }
   if (change?.error) entry.error = managementError(change.error)
+  if (typeof change?.restartReason === 'string' && change.restartReason !== '') {
+    entry.restartReason = change.restartReason
+  }
   if (Array.isArray(change?.warnings) && change.warnings.length > 0) {
     entry.warnings = change.warnings.slice(0, 3).map((warning) => truncate(String(warning), 300))
   }

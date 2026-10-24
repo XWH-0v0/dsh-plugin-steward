@@ -41,6 +41,16 @@ Every result is one of `updated`, `restart-required`, `rolled-back`, or `rollbac
 A failed rollback reports the old version and requires a manual reinstall from the official
 Plugins page.
 
+A removal that DSH reports as `restart-required` is a deferred success, not a failure: the
+new version is still installed, and the result is `restart-required`. The running process
+keeps the old code until DSH restarts. The restart reason is included in the result and in
+the per-stage diagnostics.
+
+On failure, the tab keeps a persistent failure panel showing the error code, the reason
+returned by the update service, the rollback status, and optional stage diagnostics. The
+reason can be copied for a bug report. Failed results include a top-level `reason`, a
+`failure` object with the original error, and `rollbackReason` when rollback failed.
+
 > Updates use the official plugin manager's remove-then-install flow. After a successful
 > update, the bundle rejoins the end of the profile bundle list, which can change
 > configuration precedence.

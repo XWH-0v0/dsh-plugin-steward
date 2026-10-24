@@ -100,6 +100,30 @@ window.__ModuleLoader__.load({
 .ps-update{height:24px;padding:0 9px;font-size:11px;border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 55%,var(--dsw-alias-border-l1))}
 .ps-update:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary)}
 .ps-update-progress{display:flex;align-items:center;gap:7px;margin:0 13px 9px;padding:7px 9px;border-radius:7px;font-size:11px;line-height:1.45;color:var(--dsw-alias-brand-primary);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 8%,var(--dsw-alias-bg-layer-2));border:.5px solid color-mix(in srgb,var(--dsw-alias-brand-primary) 25%,var(--dsw-alias-border-l1))}
+.ps-failure{display:flex;flex-direction:column;gap:9px;padding:12px 13px;border-radius:11px;border:.5px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 42%,var(--dsw-alias-border-l1));background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 7%,var(--dsw-alias-bg-layer-1))}
+.ps-failure[data-tone="warn"]{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 42%,var(--dsw-alias-border-l1));background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 7%,var(--dsw-alias-bg-layer-1))}
+.ps-failure-head{display:flex;align-items:flex-start;gap:9px}
+.ps-failure-icon{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:8px;flex:none;color:var(--dsw-alias-state-error-primary);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 12%,transparent)}
+.ps-failure[data-tone="warn"] .ps-failure-icon{color:var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 12%,transparent)}
+.ps-failure-heading{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.ps-failure-heading strong{font-size:12.5px;font-weight:600}
+.ps-failure-heading p{margin:0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1.45}
+.ps-failure-close{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;flex:none;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:17px;line-height:1}
+.ps-failure-close:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.ps-failure-reason{display:flex;flex-direction:column;gap:3px;padding:8px 9px;border-radius:7px;border:.5px solid var(--dsw-alias-border-l1);background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 72%,transparent)}
+.ps-failure-reason strong{font-size:11.5px;font-weight:600}
+.ps-failure-reason p{margin:0;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1.5;overflow-wrap:anywhere}
+.ps-failure-code{align-self:flex-start;margin-top:1px;padding:1px 5px;border-radius:4px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:9.5px}
+.ps-failure-rollback{margin:0;color:var(--dsw-alias-state-warn-primary);font-size:11px;line-height:1.5}
+.ps-failure-rollback[data-tone="error"]{color:var(--dsw-alias-state-error-primary)}
+.ps-failure-rollback p{margin:0}
+.ps-failure-rollback p+p{margin-top:2px;color:var(--dsw-alias-label-secondary)}
+.ps-failure-more{color:var(--dsw-alias-label-secondary);font-size:11px}
+.ps-failure-more summary{cursor:pointer;width:fit-content;border-radius:4px}
+.ps-failure-more summary:hover{color:var(--dsw-alias-label-primary)}
+.ps-failure-more pre{margin:6px 0 0;padding:8px 9px;max-height:190px;overflow:auto;border-radius:6px;border:.5px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+.ps-failure-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ps-failure-help{color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:1.45}
 .ps-row-toggle{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 5px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font-size:11px}
 .ps-row-toggle:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
 .ps-chevron{transition:transform .14s ease}
@@ -190,6 +214,39 @@ window.__ModuleLoader__.load({
       rolledBackRestartToast: '更新 {name} 失败，已安装回 v{version}；重启后完成回滚。',
       rollbackFailedToast: '更新 {name} 失败，自动回滚也未完成：{reason}。请到官方插件页手动重装 v{version}。',
       updateFailedToast: '更新 {name} 失败：{reason}',
+      updateFailureTitle: '更新失败',
+      updateFailureTarget: '{name}：v{from} → v{to}',
+      updateFailureReason: '失败原因',
+      updateFailureCode: '错误代码',
+      updateFailureRolledBack: '已自动回滚到 v{version}。',
+      updateFailureRollbackFailed: '自动回滚未完成，请到官方插件页手动重装 v{version}。',
+      updateFailureRollbackReason: '回滚失败原因',
+      updateFailureStages: '查看诊断信息',
+      updateFailureDismiss: '关闭失败详情',
+      updateFailureCopy: '复制原因',
+      updateFailureCopied: '已复制',
+      updateFailureHelp: '可以把这段信息发给插件作者。',
+      updateFailureUnknown: '更新服务没有返回具体原因。',
+      failureNotUpdatable: '没有可用的新版本，或该插件不是 registry 安装。',
+      failureVersionChanged: '可更新版本已变化，请重新检查更新。',
+      failureInvalidTarget: '目标版本无效或不是更高版本。',
+      failureNotInstalled: '插件已不在当前 profile 中。',
+      failureReadOnly: '该插件不允许自动更新。',
+      failureExternalSource: '该插件不是从 npm registry 安装的。',
+      failureInProgress: '已有更新任务正在运行。',
+      failureRemoveFailed: '移除旧版本失败。',
+      failureInstallFailed: '安装新版本失败。',
+      failureVerifyFailed: '安装后的版本校验失败。',
+      failureRollbackFailed: '自动回滚失败。',
+      failureNetwork: '无法连接更新服务。',
+      failureForbidden: '更新请求被拒绝。',
+      failureInvalidRequest: '更新请求格式无效。',
+      failureUnknownCode: '更新失败。',
+      restartReasonNoHmr: '这个 profile 只在启动时应用更改。',
+      restartReasonPackageMoved: '已安装的插件包解析到了另一个目录，或更改替换了 DSH 自带的包。',
+      restartReasonHostModule: '更改涉及 DSH 自身已加载的模块。',
+      restartReasonUnmanagedPlugin: '更改涉及一个不受插件列表管理的插件。',
+      restartReasonModuleComparison: 'DSH 无法将已加载的插件与磁盘上的文件进行比较。',
       unknownVersion: '版本未知',
       enabledTag: '已启用',
       disabledTag: '已停用',
@@ -273,6 +330,39 @@ window.__ModuleLoader__.load({
       rolledBackRestartToast: 'Updating {name} failed; v{version} is installed and the rollback completes after a restart.',
       rollbackFailedToast: 'Updating {name} failed and automatic rollback did not finish: {reason}. Reinstall v{version} from the official Plugins page.',
       updateFailedToast: 'Updating {name} failed: {reason}',
+      updateFailureTitle: 'Update failed',
+      updateFailureTarget: '{name}: v{from} → v{to}',
+      updateFailureReason: 'Reason',
+      updateFailureCode: 'Error code',
+      updateFailureRolledBack: 'Rolled back to v{version} automatically.',
+      updateFailureRollbackFailed: 'Automatic rollback did not finish. Reinstall v{version} from the official Plugins page.',
+      updateFailureRollbackReason: 'Rollback failure',
+      updateFailureStages: 'Show diagnostics',
+      updateFailureDismiss: 'Dismiss failure details',
+      updateFailureCopy: 'Copy reason',
+      updateFailureCopied: 'Copied',
+      updateFailureHelp: 'You can send this information to the plugin author.',
+      updateFailureUnknown: 'The update service did not return a specific reason.',
+      failureNotUpdatable: 'No newer version is available, or this plugin is not installed from a registry.',
+      failureVersionChanged: 'The available version changed; check for updates again.',
+      failureInvalidTarget: 'The target version is invalid or not newer.',
+      failureNotInstalled: 'The plugin is no longer installed in this profile.',
+      failureReadOnly: 'This plugin cannot be updated automatically.',
+      failureExternalSource: 'This plugin was not installed from an npm registry.',
+      failureInProgress: 'Another update is already running.',
+      failureRemoveFailed: 'Removing the old version failed.',
+      failureInstallFailed: 'Installing the new version failed.',
+      failureVerifyFailed: 'The installed version did not match the requested version.',
+      failureRollbackFailed: 'Automatic rollback failed.',
+      failureNetwork: 'Could not reach the update service.',
+      failureForbidden: 'The update request was refused.',
+      failureInvalidRequest: 'The update request was malformed.',
+      failureUnknownCode: 'The update failed.',
+      restartReasonNoHmr: 'This profile applies changes only at startup.',
+      restartReasonPackageMoved: 'The installed package resolves to another directory, or the change replaced a package shipped with DSH.',
+      restartReasonHostModule: 'The change touches modules already loaded by DSH.',
+      restartReasonUnmanagedPlugin: 'The change touches a plugin that is not managed by the plugin list.',
+      restartReasonModuleComparison: 'DSH could not compare the loaded plugins with the files on disk.',
       unknownVersion: 'Version unknown',
       enabledTag: 'On',
       disabledTag: 'Off',
@@ -499,6 +589,15 @@ window.__ModuleLoader__.load({
       }))
     }
 
+    function IconAlert({ size = 14 }) {
+      return h('svg', {
+        width: size, height: size, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true',
+      },
+      h('circle', { cx: 8, cy: 8, r: 6.2, stroke: 'currentColor', strokeWidth: 1.3 }),
+      h('path', { d: 'M8 4.8v4', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round' }),
+      h('circle', { cx: 8, cy: 11.2, r: 0.8, fill: 'currentColor' }))
+    }
+
     function IconBox({ size = 24 }) {
       return h('svg', {
         width: size, height: size, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': 'true',
@@ -633,9 +732,11 @@ window.__ModuleLoader__.load({
         }
       }
       if (result.status === 'restart-required') {
+        const reason = restartReasonLabel(result.restartReason, t)
         return {
           tone: 'warn',
-          text: t('updatedRestartToast', { name, version: result.toVersion }),
+          text: t('updatedRestartToast', { name, version: result.toVersion })
+            + (reason === '' ? '' : ` ${reason}`),
         }
       }
       if (result.status === 'rolled-back') {
@@ -653,7 +754,7 @@ window.__ModuleLoader__.load({
           text: t('rollbackFailedToast', {
             name,
             version: result.fromVersion,
-            reason: result.rollbackError || result.failure?.detail || t('unknownError'),
+            reason: result.rollbackReason || result.rollbackError || result.failure?.detail || t('unknownError'),
           }),
         }
       }
@@ -661,9 +762,189 @@ window.__ModuleLoader__.load({
         tone: 'error',
         text: t('updateFailedToast', {
           name,
-          reason: (result.failure && result.failure.detail) || t('unknownError'),
+          reason: result.reason || (result.failure && result.failure.detail) || t('unknownError'),
         }),
       }
+    }
+
+    const RESTART_REASON_KEYS = {
+      'no-hmr': 'restartReasonNoHmr',
+      'package-moved': 'restartReasonPackageMoved',
+      'host-module': 'restartReasonHostModule',
+      'unmanaged-plugin': 'restartReasonUnmanagedPlugin',
+      'module-comparison': 'restartReasonModuleComparison',
+    }
+
+    function restartReasonLabel(reason, t) {
+      if (typeof reason !== 'string' || reason === '') return ''
+      const key = RESTART_REASON_KEYS[reason]
+      return key === undefined ? reason : t(key)
+    }
+
+    const FAILURE_CODE_KEYS = {
+      'not-updatable': 'failureNotUpdatable',
+      'version-changed': 'failureVersionChanged',
+      'invalid-target': 'failureInvalidTarget',
+      'not-installed': 'failureNotInstalled',
+      'read-only': 'failureReadOnly',
+      'external-source': 'failureExternalSource',
+      'update-in-progress': 'failureInProgress',
+      'remove-failed': 'failureRemoveFailed',
+      'install-failed': 'failureInstallFailed',
+      'verify-failed': 'failureVerifyFailed',
+      'rollback-failed': 'failureRollbackFailed',
+      'network': 'failureNetwork',
+      'forbidden': 'failureForbidden',
+      'missing-update-intent': 'failureForbidden',
+      'invalid-body': 'failureInvalidRequest',
+      'invalid-json': 'failureInvalidRequest',
+      'unsupported-media-type': 'failureInvalidRequest',
+      'body-too-large': 'failureInvalidRequest',
+      'update-failed': 'failureUnknownCode',
+    }
+
+    function failureCodeLabel(code, t) {
+      const key = FAILURE_CODE_KEYS[code]
+      return key === undefined ? (code || t('failureUnknownCode')) : t(key)
+    }
+
+    function stagesText(stages) {
+      if (!Array.isArray(stages)) return ''
+      return stages.map((stage) => {
+        const parts = [String(stage.stage || 'stage')]
+        if (typeof stage.application === 'string') parts.push(stage.application)
+        if (stage.changed === false) parts.push('changed=false')
+        if (typeof stage.restartReason === 'string' && stage.restartReason !== '') {
+          parts.push(`restart=${stage.restartReason}`)
+        }
+        if (typeof stage.error === 'string' && stage.error !== '') parts.push(stage.error)
+        if (Array.isArray(stage.warnings) && stage.warnings.length > 0) {
+          parts.push(stage.warnings.join('; '))
+        }
+        return parts.join(' · ')
+      }).join('\n')
+    }
+
+    function failureFromResult(result, title) {
+      const failure = result && result.failure && typeof result.failure === 'object'
+        ? result.failure
+        : {}
+      const status = result && typeof result.status === 'string' ? result.status : 'failed'
+      return {
+        name: result && typeof result.name === 'string' ? result.name : '',
+        title,
+        fromVersion: result && typeof result.fromVersion === 'string' ? result.fromVersion : '',
+        toVersion: result && typeof result.toVersion === 'string' ? result.toVersion : '',
+        status,
+        code: typeof failure.code === 'string'
+          ? failure.code
+          : (status === 'rollback-failed' ? 'rollback-failed' : 'update-failed'),
+        reason: result && typeof result.reason === 'string'
+          ? result.reason
+          : (typeof failure.detail === 'string' ? failure.detail : ''),
+        rollbackReason: result && typeof result.rollbackReason === 'string'
+          ? result.rollbackReason
+          : (result && typeof result.rollbackError === 'string' ? result.rollbackError : ''),
+        stages: result && Array.isArray(result.stages) ? result.stages : [],
+      }
+    }
+
+    function failureFromHttp(payload, view, target, error, fallbackCode = 'network') {
+      const code = payload && typeof payload.error === 'string' ? payload.error : fallbackCode
+      const reason = payload && typeof payload.reason === 'string'
+        ? payload.reason
+        : (payload && typeof payload.detail === 'string'
+          ? payload.detail
+          : (error ? messageOf(error) : ''))
+      return {
+        name: view.bundle.name,
+        title: view.title,
+        fromVersion: typeof view.bundle.version === 'string' ? view.bundle.version : '',
+        toVersion: target,
+        status: 'failed',
+        code,
+        reason,
+        rollbackReason: '',
+        stages: [],
+      }
+    }
+
+    function UpdateFailurePanel({ failure, t, onDismiss }) {
+      const [copied, setCopied] = useState(false)
+      const reason = failure.reason || t('updateFailureUnknown')
+      const codeLabel = failureCodeLabel(failure.code, t)
+      const diagnostics = stagesText(failure.stages)
+      const target = t('updateFailureTarget', {
+        name: failure.title || failure.name || 'Plugin',
+        from: failure.fromVersion || '?',
+        to: failure.toVersion || '?',
+      })
+      const copyText = [
+        `${target}`,
+        `${t('updateFailureReason')}: ${reason}`,
+        `${t('updateFailureCode')}: ${failure.code || 'unknown'}`,
+        failure.rollbackReason ? `${t('updateFailureRollbackReason')}: ${failure.rollbackReason}` : '',
+        diagnostics ? `${t('updateFailureStages')}:\n${diagnostics}` : '',
+      ].filter(Boolean).join('\n')
+
+      async function copyReason() {
+        try {
+          if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            await navigator.clipboard.writeText(copyText)
+            setCopied(true)
+          }
+        } catch {
+          // Clipboard permission is optional; the reason remains on screen.
+        }
+      }
+
+      const rollbackFailed = failure.status === 'rollback-failed'
+      const rolledBack = failure.status === 'rolled-back'
+      const tone = rollbackFailed ? 'error' : rolledBack ? 'warn' : 'error'
+
+      return h('section', {
+        className: 'ps-failure',
+        'data-tone': tone,
+        role: 'alert',
+        'aria-label': t('updateFailureTitle'),
+      },
+      h('div', { className: 'ps-failure-head' },
+        h('span', { className: 'ps-failure-icon', 'aria-hidden': 'true' }, h(IconAlert, { size: 16 })),
+        h('div', { className: 'ps-failure-heading' },
+          h('strong', null, t('updateFailureTitle')),
+          h('p', null, target)),
+        h('button', {
+          type: 'button',
+          className: 'ps-failure-close',
+          'aria-label': t('updateFailureDismiss'),
+          title: t('updateFailureDismiss'),
+          onClick: onDismiss,
+        }, '×')),
+      h('div', { className: 'ps-failure-reason' },
+        h('strong', null, codeLabel),
+        h('p', null, reason),
+        h('code', { className: 'ps-failure-code' }, failure.code || 'unknown')),
+      rolledBack
+        ? h('p', { className: 'ps-failure-rollback' },
+          t('updateFailureRolledBack', { version: failure.fromVersion || '?' }))
+        : null,
+      rollbackFailed
+        ? h('div', { className: 'ps-failure-rollback', 'data-tone': 'error' },
+          h('p', null, t('updateFailureRollbackFailed', { version: failure.fromVersion || '?' })),
+          failure.rollbackReason
+            ? h('p', null, `${t('updateFailureRollbackReason')}: ${failure.rollbackReason}`)
+            : null)
+        : null,
+      diagnostics === '' ? null : h('details', { className: 'ps-failure-more' },
+        h('summary', null, t('updateFailureStages')),
+        h('pre', null, diagnostics)),
+      h('div', { className: 'ps-failure-actions' },
+        h('button', {
+          type: 'button',
+          className: 'ps-btn ps-ghost',
+          onClick: () => { void copyReason() },
+        }, copied ? t('updateFailureCopied') : t('updateFailureCopy')),
+        h('span', { className: 'ps-failure-help' }, t('updateFailureHelp'))))
     }
 
     function BundleCard({
@@ -873,6 +1154,7 @@ window.__ModuleLoader__.load({
       const [busyKeys, setBusyKeys] = useState({})
       const [notice, setNotice] = useState(null)
       const [updating, setUpdating] = useState(null)
+      const [updateFailure, setUpdateFailure] = useState(null)
       const updateState = useUpdates()
       const loadGeneration = useRef(0)
       const updateInFlight = useRef(false)
@@ -990,6 +1272,7 @@ window.__ModuleLoader__.load({
 
         updateInFlight.current = true
         setUpdating({ name: view.bundle.name, version: target })
+        setUpdateFailure(null)
         setNotice(null)
         try {
           const response = await fetch(UPDATE_PATH, {
@@ -1009,16 +1292,50 @@ window.__ModuleLoader__.load({
             // The status check below produces a useful message.
           }
           if (!response.ok || payload === null || payload.ok !== true) {
-            const detail = payload && (payload.detail || payload.error)
-            throw new Error(detail || `HTTP ${response.status}`)
+            const failure = failureFromHttp(payload, view, target, null, 'update-failed')
+            setUpdateFailure(failure)
+            setNotice({
+              tone: 'error',
+              text: translate('updateFailedToast', {
+                name: view.title,
+                reason: failure.reason || translate('unknownError'),
+              }),
+            })
+            void refresh()
+            void ensureUpdates(true)
+            return
           }
-          setNotice(describeUpdate(payload.result, view.title, translate))
+
+          const result = payload.result
+          if (!result || typeof result !== 'object') {
+            const failure = failureFromHttp(null, view, target, new Error(translate('unknownError')), 'update-failed')
+            setUpdateFailure(failure)
+            setNotice({
+              tone: 'error',
+              text: translate('updateFailedToast', {
+                name: view.title,
+                reason: failure.reason,
+              }),
+            })
+            void refresh()
+            void ensureUpdates(true)
+            return
+          }
+
+          if (result.status === 'rolled-back' || result.status === 'rollback-failed' || result.status === 'failed') {
+            setUpdateFailure(failureFromResult(result, view.title))
+          } else {
+            setUpdateFailure(null)
+          }
+          setNotice(describeUpdate(result, view.title, translate))
           await refresh()
           await ensureUpdates(true)
         } catch (error) {
+          const failure = failureFromHttp(null, view, target, error)
+          setUpdateFailure(failure)
           setNotice({
             tone: 'error',
-            text: translate('updateFailedToast', { name: view.title, reason: messageOf(error) }),
+            text: translate('updateFailedToast', { name: view.title, reason: failure.reason }),
           })
           void refresh()
           void ensureUpdates(true)
@@ -1183,6 +1500,11 @@ window.__ModuleLoader__.load({
             },
             updateBusy ? h(Spinner) : h(IconUpdate),
             updateBusy ? translate('checking') : translate('checkUpdates')))),
+        updateFailure === null ? null : h(UpdateFailurePanel, {
+          failure: updateFailure,
+          t: translate,
+          onDismiss: () => setUpdateFailure(null),
+        }),
         notice === null ? null : h('div', {
           className: 'ps-notice',
           'data-tone': notice.tone,
