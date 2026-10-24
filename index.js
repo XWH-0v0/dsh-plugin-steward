@@ -11,6 +11,7 @@
 
 const ROUTE_PATH = '/dsh-plugin-steward/updates'
 const UPDATE_ROUTE_PATH = '/dsh-plugin-steward/update'
+const GITHUB_API = 'https://api.github.com'
 const CACHE_TTL_MS = 10 * 60 * 1000
 const FETCH_TIMEOUT_MS = 7000
 const UPDATE_BODY_BYTES = 8192
@@ -239,14 +240,38 @@ async function performUpdate(ctx, load, name, requestedVersion) {
   }
 
   const source = typeof bundle.source === 'string' ? bundle.source.trim() : ''
-  if (source === '' || EXTERNAL_SOURCE.test(source) || name.startsWith('@local/')) {
-    throw updateProblem('external-source', 'Only registry packages can be updated automatically.')
+  const isGitHub = info.provider === 'github'
+  let installSpec = null
+  let rollbackSpecs = []
+  let githubRepo = null
+
+  if (isGitHub) {
+    const parsed = parseGitHubSource(source)
+    if (parsed === null || `${parsed.owner}/${parsed.repo}` !== info.repo) {
+      throw updateProblem('external-source', 'The installed GitHub source does not match the release repository.')
+    }
+    if (!isGitHubSpec(info.installSpec) || !Array.isArray(info.rollbackSpecs)) {
+      throw updateProblem('invalid-target', 'The cached GitHub release target is invalid.')
+    }
+    rollbackSpecs = info.rollbackSpecs.filter(isGitHubSpec)
+    if (rollbackSpecs.length === 0) {
+      throw updateProblem('invalid-target', 'No safe rollback target is known for this GitHub plugin.')
+    }
+    installSpec = info.installSpec
+    githubRepo = info.repo
+  } else {
+    if (source === '' || EXTERNAL_SOURCE.test(source) || name.startsWith('@local/')) {
+      throw updateProblem('external-source', 'Only registry packages and explicit GitHub sources can be updated automatically.')
+    }
+    installSpec = `${name}@${requestedVersion}`
+    rollbackSpecs = [`${name}@${fromVersion}`]
   }
 
   const enabled = bundle.enabled === true
-  const registry = typeof info.registry === 'string' && /^https?:\/\//i.test(info.registry)
-    ? info.registry
-    : undefined
+  const registry = isGitHub
+    ? undefined
+    : (typeof info.registry === 'string' && /^https?:\/\//i.test(info.registry) ? info.registry : undefined)
+  const installArgs = isGitHub ? { enabled, saveExact: true } : installOptions(enabled, registry)
   const stages = []
   let failure = null
   let deferredRemoval = false
@@ -265,8 +290,8 @@ async function performUpdate(ctx, load, name, requestedVersion) {
 
     installAttempted = true
     const installed = await ctx.pluginManager.installBundle(
-      `${name}@${requestedVersion}`,
-      installOptions(enabled, registry),
+      installSpec,
+      installArgs,
     )
     stages.push(stageOf('install', installed))
     if (!installSucceeded(installed)) {
@@ -282,6 +307,10 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     const restartRequired = deferredRemoval || installed.application === 'restart-required'
     return {
       status: restartRequired ? 'restart-required' : 'updated',
+      provider: isGitHub ? 'github' : 'registry',
+      repo: githubRepo,
+      releaseTag: isGitHub && typeof info.releaseTag === 'string' ? info.releaseTag : null,
+      releaseUrl: isGitHub && typeof info.releaseUrl === 'string' ? info.releaseUrl : null,
       name,
       fromVersion,
       toVersion: requestedVersion,
@@ -311,16 +340,21 @@ async function performUpdate(ctx, load, name, requestedVersion) {
 
   let rollback = null
   let rollbackError = null
-  try {
-    rollback = await ctx.pluginManager.installBundle(
-      `${name}@${fromVersion}`,
-      installOptions(enabled, registry),
-    )
-    stages.push(stageOf('rollback', rollback))
-    if (!installSucceeded(rollback)) rollbackError = changeReason(rollback)
-  } catch (error) {
-    rollbackError = messageOf(error)
-    stages.push({ stage: 'rollback', error: truncate(rollbackError, 600) })
+  for (let index = 0; index < rollbackSpecs.length; index += 1) {
+    const stage = index === 0 ? 'rollback' : `rollback-${index + 1}`
+    try {
+      const attempt = await ctx.pluginManager.installBundle(rollbackSpecs[index], installArgs)
+      stages.push(stageOf(stage, attempt))
+      if (installSucceeded(attempt)) {
+        rollback = attempt
+        rollbackError = null
+        break
+      }
+      rollbackError = changeReason(attempt)
+    } catch (error) {
+      rollbackError = messageOf(error)
+      stages.push({ stage, error: truncate(rollbackError, 600) })
+    }
   }
 
   // A retry can report "already installed" after a partial cleanup; the
@@ -334,9 +368,13 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     // The rollback stage already carries the useful diagnostic.
   }
 
-  if (restored || (rollback !== null && installSucceeded(rollback))) {
+  if (restored || (!isGitHub && rollback !== null && installSucceeded(rollback))) {
     return {
       status: 'rolled-back',
+      provider: isGitHub ? 'github' : 'registry',
+      repo: githubRepo,
+      releaseTag: isGitHub && typeof info.releaseTag === 'string' ? info.releaseTag : null,
+      releaseUrl: isGitHub && typeof info.releaseUrl === 'string' ? info.releaseUrl : null,
       name,
       fromVersion,
       toVersion: requestedVersion,
@@ -351,6 +389,10 @@ async function performUpdate(ctx, load, name, requestedVersion) {
 
   return {
     status: 'rollback-failed',
+    provider: isGitHub ? 'github' : 'registry',
+    repo: githubRepo,
+    releaseTag: isGitHub && typeof info.releaseTag === 'string' ? info.releaseTag : null,
+    releaseUrl: isGitHub && typeof info.releaseUrl === 'string' ? info.releaseUrl : null,
     name,
     fromVersion,
     toVersion: requestedVersion,
@@ -463,9 +505,10 @@ function truncate(value, limit) {
 }
 
 /**
- * Read the profile's installed bundles and compare each registry package with
- * its registry's `latest` dist-tag. Local, linked, git and archived installs
- * are reported as `local` instead of pretending a registry can update them.
+ * Read the profile's installed bundles and compare each package with its
+ * registry's `latest` dist-tag, or with the latest GitHub Release when the
+ * package was installed from a GitHub source. Local and linked installs remain
+ * outside the update surface.
  */
 async function computeUpdates(ctx) {
   const all = await ctx.pluginManager.listBundles()
@@ -475,24 +518,31 @@ async function computeUpdates(ctx) {
     && bundle.name !== SELF_PACKAGE
   ))
   const registries = await registryUrls(ctx)
+  const github = githubAccess()
   const packages = {}
 
   await Promise.all(installed.map(async (bundle) => {
-    packages[bundle.name] = await inspectBundle(bundle, registries)
+    packages[bundle.name] = await inspectBundle(bundle, registries, github)
   }))
 
   return {
     checkedAt: Date.now(),
     registries,
+    github: { authenticated: github.token !== null },
     packages,
   }
 }
 
-async function inspectBundle(bundle, registries) {
+async function inspectBundle(bundle, registries, github) {
   const current = typeof bundle.version === 'string' && bundle.version !== ''
     ? bundle.version
     : null
   const source = typeof bundle.source === 'string' ? bundle.source.trim() : ''
+  const githubSource = parseGitHubSource(source)
+
+  if (githubSource !== null) {
+    return inspectGitHubBundle(bundle, githubSource, current, source, github)
+  }
 
   if (EXTERNAL_SOURCE.test(source) || bundle.name.startsWith('@local/')) {
     return {
@@ -558,6 +608,195 @@ async function inspectBundle(bundle, registries) {
     source,
     reason: lastError || 'no-registry-answered',
   }
+}
+
+async function inspectGitHubBundle(bundle, parsed, current, source, github) {
+  const repo = `${parsed.owner}/${parsed.repo}`
+  const base = {
+    provider: 'github',
+    repo,
+    source,
+    current,
+  }
+
+  if (current === null) {
+    return { ...base, status: 'unknown', latest: null, reason: 'missing-version' }
+  }
+  const currentParsed = parseVersion(current)
+  if (currentParsed === null) {
+    return { ...base, status: 'unknown', latest: null, reason: 'unreadable-version' }
+  }
+
+  try {
+    const release = await githubJson(
+      `/repos/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}/releases/latest`,
+      github,
+    )
+    if (!release || typeof release.tag_name !== 'string' || release.tag_name.trim() === '') {
+      return { ...base, status: 'unknown', latest: null, reason: 'release-without-tag' }
+    }
+    const releaseTag = release.tag_name.trim()
+    const latest = normalizeReleaseVersion(releaseTag)
+    if (latest === null) {
+      return { ...base, status: 'unknown', latest: null, releaseTag, reason: 'unreadable-release-tag' }
+    }
+    const latestParsed = parseVersion(latest)
+    if (latestParsed === null) {
+      return { ...base, status: 'unknown', latest: null, releaseTag, reason: 'unreadable-release-tag' }
+    }
+
+    const releaseUrl = typeof release.html_url === 'string' ? release.html_url : null
+    const publishedAt = typeof release.published_at === 'string' ? release.published_at : null
+    if (compareVersions(latestParsed, currentParsed) <= 0) {
+      return {
+        ...base,
+        status: 'current',
+        latest,
+        releaseTag,
+        releaseUrl,
+        publishedAt,
+      }
+    }
+
+    const installSpec = buildGitHubSpec(parsed.owner, parsed.repo, releaseTag, parsed.path)
+    const rollbackSpecs = githubRollbackSpecs(parsed, current, source)
+    return {
+      ...base,
+      status: 'update',
+      latest,
+      releaseTag,
+      releaseUrl,
+      publishedAt,
+      installSpec,
+      rollbackSpecs,
+    }
+  } catch (error) {
+    return {
+      ...base,
+      status: 'unknown',
+      latest: null,
+      reason: messageOf(error),
+    }
+  }
+}
+
+/**
+ * Parse only explicit GitHub package sources. A release asset URL or an
+ * arbitrary web URL is deliberately not treated as a repository.
+ */
+function parseGitHubSource(source) {
+  if (typeof source !== 'string' || source.trim() === '') return null
+  let value = source.trim()
+  let path = ''
+
+  const pathMatch = /(?:&|\?)path:([^#&\s]+)/i.exec(value)
+  if (pathMatch !== null) {
+    path = normalizeGitPath(pathMatch[1])
+    if (path === null) return null
+    value = value.replace(pathMatch[0], '')
+  }
+
+  const patterns = [
+    /^github:([^/\s#]+)\/([^/\s#]+?)(?:\.git)?(?:#(.+))?$/i,
+    /^git\+https?:\/\/github\.com\/([^/\s#]+)\/([^/\s#]+?)(?:\.git)?(?:#(.+))?$/i,
+    /^https?:\/\/github\.com\/([^/\s#]+)\/([^/\s#]+?)(?:\.git)?(?:#(.+))?$/i,
+    /^git\+ssh:\/\/git@github\.com\/([^/\s#]+)\/([^/\s#]+?)(?:\.git)?(?:#(.+))?$/i,
+    /^git@github\.com:([^/\s#]+)\/([^/\s#]+?)(?:\.git)?(?:#(.+))?$/i,
+  ]
+
+  for (const pattern of patterns) {
+    const match = pattern.exec(value)
+    if (match === null) continue
+    const owner = match[1]
+    const repo = match[2].replace(/\.git$/i, '')
+    const ref = typeof match[3] === 'string' && match[3] !== '' ? match[3] : null
+    if (!isRepoPart(owner) || !isRepoPart(repo)) return null
+    return { owner, repo, ref, path }
+  }
+  return null
+}
+
+function normalizeGitPath(value) {
+  const path = value.startsWith('/') ? value : `/${value}`
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(path) || path.includes('..')) return null
+  return path
+}
+
+function isRepoPart(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 100
+    && /^[A-Za-z0-9_.-]+$/.test(value)
+    && value !== '.'
+    && value !== '..'
+}
+
+function isSafeGitRef(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 200
+    && /^[A-Za-z0-9][A-Za-z0-9._/@+-]*$/.test(value)
+    && !value.includes('..')
+    && !value.endsWith('/')
+    && !value.endsWith('.')
+}
+
+function buildGitHubSpec(owner, repo, ref, path) {
+  if (!isRepoPart(owner) || !isRepoPart(repo) || !isSafeGitRef(ref)) {
+    throw new Error('Unsafe GitHub release reference.')
+  }
+  const pathPart = typeof path === 'string' && path !== '' ? `&path:${path}` : ''
+  return `git+https://github.com/${owner}/${repo}.git${pathPart}#${ref}`
+}
+
+function isGitHubSpec(value) {
+  if (typeof value !== 'string' || value.length > 500) return false
+  if (!value.startsWith('git+https://github.com/')) return false
+  const fragment = value.lastIndexOf('#')
+  if (fragment <= 0 || fragment === value.length - 1) return false
+  return isSafeGitRef(value.slice(fragment + 1))
+}
+
+function githubRollbackSpecs(parsed, current, source) {
+  const specs = []
+  const add = (value) => {
+    if (typeof value === 'string' && value !== '' && !specs.includes(value)) specs.push(value)
+  }
+
+  // A source pinned to a commit is the most exact rollback target.
+  if (parsed.ref !== null && /^[0-9a-f]{7,40}$/i.test(parsed.ref)) add(source)
+  add(buildGitHubSpec(parsed.owner, parsed.repo, `v${current}`, parsed.path))
+  add(buildGitHubSpec(parsed.owner, parsed.repo, current, parsed.path))
+  // A branch/tag source is a last resort if neither version tag exists.
+  if (parsed.ref !== null) add(source)
+  return specs
+}
+
+function normalizeReleaseVersion(tag) {
+  if (typeof tag !== 'string') return null
+  const value = tag.trim().replace(/^v/i, '')
+  return parseVersion(value) === null ? null : value
+}
+
+function githubAccess() {
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_PAT
+  return {
+    token: typeof token === 'string' && token.trim() !== '' ? token.trim() : null,
+  }
+}
+
+async function githubJson(path, github) {
+  const headers = {
+    accept: 'application/vnd.github+json',
+    'user-agent': 'dsh-plugin-steward/1.2.0',
+  }
+  if (github && github.token !== null) headers.authorization = `Bearer ${github.token}`
+  const response = await fetch(`${GITHUB_API}${path}`, {
+    headers,
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  })
+  if (!response.ok) throw new Error(`GitHub HTTP ${response.status}`)
+  return await response.json()
 }
 
 /**

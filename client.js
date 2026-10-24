@@ -204,7 +204,8 @@ window.__ModuleLoader__.load({
       updateBadge: '可更新',
       updateTo: '可更新至 {version}',
       checkFailedTag: '未检查',
-      updateHint: '点「更新」会下载并安装新版本；下载或安装失败会自动回滚。',
+      githubTag: 'GitHub',
+      updateHint: '点「更新」会从 npm registry 或 GitHub Release 安装新版本；失败会自动回滚。',
       updateAction: '更新到 v{version}',
       updating: '正在更新…',
       updatingHint: '正在拉取 v{version}；失败会自动回滚，请不要关闭页面。',
@@ -280,7 +281,7 @@ window.__ModuleLoader__.load({
       bundleError: '插件载入异常：{reason}',
       metaError: '显示信息读取失败：{reason}',
       unknownError: '未知错误',
-      footerNote: '更新会先移除旧版本再安装新版本；任何一步失败都会尝试回滚。本地、链接和 Git 安装不会检查或自动更新。',
+      footerNote: '更新检查覆盖 npm registry 和 GitHub Releases；本地、链接和非 Git 来源不会检查或自动更新。',
     }
 
     const en = {
@@ -320,7 +321,8 @@ window.__ModuleLoader__.load({
       updateBadge: 'Update available',
       updateTo: 'Version {version} is available',
       checkFailedTag: 'Not checked',
-      updateHint: '“Update” downloads and installs the new version; a failed download or install rolls back automatically.',
+      githubTag: 'GitHub',
+      updateHint: '“Update” installs the new version from npm or GitHub Releases; a failure rolls back automatically.',
       updateAction: 'Update to v{version}',
       updating: 'Updating…',
       updatingHint: 'Fetching v{version}; failures roll back automatically. Keep this page open.',
@@ -396,7 +398,7 @@ window.__ModuleLoader__.load({
       bundleError: 'Plugin load error: {reason}',
       metaError: 'Display metadata error: {reason}',
       unknownError: 'Unknown error',
-      footerNote: 'Updates remove the old version before installing the new one and try to roll back if any step fails. Local, linked, and Git installs are neither checked nor auto-updated.',
+      footerNote: 'Update checks cover npm and GitHub Releases. Local, linked, and non-Git sources are neither checked nor auto-updated.',
     }
 
     function createStore(initial) {
@@ -1010,6 +1012,10 @@ window.__ModuleLoader__.load({
             h(IconUpdate, { size: 10 }),
             t('updateBadge'),
             updatedVersion === '' ? null : h('span', { className: 'ps-tag-version' }, `v${updatedVersion}`)) : null,
+            isUpdate && updateInfo.provider === 'github' ? h(Tag, {
+              tone: 'neutral',
+              title: `${updateInfo.repo || 'GitHub'}${updateInfo.releaseTag ? ` · ${updateInfo.releaseTag}` : ''}`,
+            }, t('githubTag')) : null,
             updateUnchecked ? h(Tag, {
               tone: 'neutral',
               title: updateInfo.reason || t('updateCheckFailed'),

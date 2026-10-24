@@ -9,7 +9,8 @@ A DSH Web plugin that adds a **Plugin Steward** tab to the running Plugins page.
 - Search installed profile bundles by title, package name, description, or component name.
 - Sort by name, enabled state, or update availability.
 - Switch a whole bundle on or off, or switch one of its loader rows independently.
-- Check npm registries for newer releases and mark affected bundles with **Update available**.
+- Check npm registries and GitHub Releases for newer releases, and mark affected bundles
+  with **Update available**.
 - Update an exact new version in place. If removal, download, install, or activation fails,
   the Host cleans up the failed attempt and reinstalls the previous version.
 - Preserve the bundle's enabled/disabled state across an update and report when a restart is
@@ -55,11 +56,18 @@ reason can be copied for a bug report. Failed results include a top-level `reaso
 > update, the bundle rejoins the end of the profile bundle list, which can change
 > configuration precedence.
 
-## Scope
+## Update sources
 
-- Only registry-installed, removable profile bundles are auto-updated.
-- Local paths, `link:`, Git, tarball, read-only bundles, and Plugin Steward itself are not
-  auto-updated.
+- npm registry packages compare their registry's `latest` dist-tag.
+- Explicit GitHub package sources compare the latest GitHub Release whose tag is a SemVer
+  version. The update installs that release tag as an exact Git spec and rolls back to the
+  old version's tag (or the original commit for a pinned source).
+- GitHub release assets are not downloaded; the release tag is installed.
+- Public GitHub repositories work without credentials. For a private repository or higher
+  rate limits, set `GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_PAT` in the Host environment. The
+  Git install itself still needs Git credentials configured for the Host.
+- Local paths, `link:`, GitHub sources without a SemVer release, tarball installs, read-only
+  bundles, and Plugin Steward itself are not auto-updated.
 - `pluginManager.installBundle` checks compatibility with the running DSH version; a
   failure triggers rollback.
 - Changes that need a DSH restart are reported as `restart-required` instead of claiming the
@@ -70,17 +78,17 @@ reason can be copied for a bug report. Failed results include a top-level `reaso
 The browser half uses the generated `pluginManager` Remote namespace for inventory and
 enablement. The Host half adds two same-origin routes:
 
-- `GET /dsh-plugin-steward/updates` — cached registry comparison with a ten-minute TTL.
-- `POST /dsh-plugin-steward/update` — removes the old registry bundle, installs the exact
-  version, verifies it, and rolls back on failure.
+- `GET /dsh-plugin-steward/updates` — cached npm/GitHub Release comparison with a ten-minute
+  TTL.
+- `POST /dsh-plugin-steward/update` — removes the old bundle, installs the exact npm or
+  GitHub Release target, verifies it, and rolls back on failure.
 
 The update route requires:
 
 - a loopback Host and a same-origin request;
 - a JSON request body;
 - the private `x-plugin-steward-update: 1` header;
-- a target that is installed, removable, non-local/non-Git, not read-only, and not this
-  plugin;
+- a target that is installed, removable, not read-only, and not this plugin;
 - a target version matching the cached `latest`.
 
 Only one update runs at a time.
@@ -98,6 +106,8 @@ Only one update runs at a time.
 - The update route accepts only same-origin loopback requests and requires the private
   intent header.
 - The target version is validated against the Host's update cache; the browser cannot choose
-  an arbitrary version or registry.
+  an arbitrary version, registry, or GitHub ref.
+- GitHub API credentials are read from the Host environment and are never returned to the
+  browser; only `api.github.com` is contacted.
 - Updates and rollbacks call the official `pluginManager` service, so compatibility checks,
   build-script approval, and the profile write lock still apply.

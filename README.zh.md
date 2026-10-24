@@ -9,7 +9,7 @@
 - 按标题、包名、描述或组件名搜索已安装的 profile bundle。
 - 按名称、启用状态或更新状态排序。
 - 一键开启/关闭整个 bundle，也可以单独控制它的 Loader row。
-- 从 npm registry 检查新版本，在卡片上显示「可更新」标签。
+- 从 npm registry 或 GitHub Releases 检查新版本，在卡片上显示「可更新」标签。
 - 点击「更新到 vX.Y.Z」直接安装精确的新版本。
 - 新版本在移除、下载、安装或激活阶段失败时，自动清理失败版本并重装旧版本。
 - 更新会保留原 bundle 的启用/停用状态；需要重启时会明确提示。
@@ -49,10 +49,17 @@
 > 更新沿用官方插件管理的「移除 + 安装」流程。因此更新成功后，该 bundle 会重新排到
 > profile bundle 列表末尾，可能影响配置覆盖顺序。
 
-## 支持范围
+## 更新来源
 
-- 只自动更新从 npm registry 安装、且 `removable` 的 profile bundle。
-- 本地路径、`link:`、Git、tarball、只读 bundle 和插件管家自身不会自动更新。
+- npm registry 包比较 registry 的 `latest` dist-tag。
+- 明确的 GitHub 包源比较最新 GitHub Release；只有 tag 是 SemVer 版本时才会提供更新。
+  更新会安装该 Release tag 对应的精确 Git spec；失败时回滚到旧版本 tag，pinned 源则
+  回滚到原 commit。
+- 不会下载 GitHub Release 附件，而是安装 release tag 指向的源码。
+- 公开 GitHub 仓库无需凭据。私有仓库或需要更高 API 限额时，在 Host 环境设置
+  `GITHUB_TOKEN`、`GH_TOKEN` 或 `GITHUB_PAT`；Git 安装本身仍需要 Host 配好 Git 凭据。
+- 本地路径、`link:`、没有 SemVer Release 的 GitHub 源、tarball、只读 bundle 和插件管家
+  自身不会自动更新。
 - 新版本是否兼容当前 DSH 由 `pluginManager.installBundle` 检查；不兼容时会触发回滚。
 - 需要 DSH 重启才能完成的变更会显示 `restart-required`，不会伪装成已经生效。
 
@@ -61,15 +68,16 @@
 浏览器端通过生成的 `pluginManager` Remote 命名空间读取插件清单并开关插件。
 Host 端增加两个同源接口：
 
-- `GET /dsh-plugin-steward/updates`：带 10 分钟缓存的 registry 版本检查。
-- `POST /dsh-plugin-steward/update`：移除旧 bundle、安装精确新版本、校验版本，并在失败时回滚。
+- `GET /dsh-plugin-steward/updates`：带 10 分钟缓存的 npm / GitHub Release 版本检查。
+- `POST /dsh-plugin-steward/update`：移除旧 bundle、安装精确的 npm 或 GitHub Release 目标、
+  校验版本，并在失败时回滚。
 
 更新接口要求：
 
 - 本机回环地址与同源请求；
 - JSON 请求体；
 - 私有请求头 `x-plugin-steward-update: 1`；
-- 目标必须是已安装、可移除、非本地/Git、非只读且不是插件管家自身的 bundle；
+- 目标必须是已安装、可移除、非只读且不是插件管家自身的 bundle；
 - 目标版本必须与缓存中的 `latest` 一致。
 
 同一时间只允许一个更新任务。
@@ -85,5 +93,6 @@ Host 端增加两个同源接口：
 ## 安全
 
 - 更新接口只接受同源、本机回环请求，并要求私有意图头。
-- 目标版本由 Host 端更新缓存校验，浏览器不能指定任意版本或 registry。
+- 目标版本由 Host 端更新缓存校验，浏览器不能指定任意版本、registry 或 GitHub ref。
+- GitHub API 凭据只从 Host 环境读取，不会返回给浏览器；只会访问 `api.github.com`。
 - 更新和回滚调用官方 `pluginManager` 服务，兼容性检查、构建脚本审批和 profile 写入锁仍然生效。
