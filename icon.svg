@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Plugin Steward">
+  <rect x="5" y="7" width="54" height="50" rx="13" fill="#2E6BFF"/>
+  <rect x="13" y="17" width="38" height="7" rx="3.5" fill="#DCE7FF"/>
+  <circle cx="47" cy="20.5" r="4" fill="#9FBBFF"/>
+  <rect x="13" y="29" width="38" height="7" rx="3.5" fill="#FFFFFF" fill-opacity=".92"/>
+  <rect x="39" y="29" width="12" height="7" rx="3.5" fill="#B9CDFF"/>
+  <rect x="13" y="41" width="38" height="7" rx="3.5" fill="#FFFFFF" fill-opacity=".92"/>
+  <circle cx="23" cy="44.5" r="4" fill="#9FBBFF"/>
+  <circle cx="50" cy="13" r="10" fill="#F5A524" stroke="#FFFFFF" stroke-width="3"/>
+  <path d="M50 8.5v7" stroke="#FFFFFF" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M47 11.5 50 8.5l3 3" fill="none" stroke="#FFFFFF" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

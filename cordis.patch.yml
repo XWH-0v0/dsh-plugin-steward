@@ -1,0 +1,3 @@
+- insert:
+    - id: plugin-steward
+      name: '@local/dsh-plugin-steward'

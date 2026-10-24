@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Plugin Steward",
+    "description": "Search, sort, and switch installed plugins, then update in place with automatic rollback if the new version fails."
+  }
+}
