@@ -1,6 +1,10 @@
 # Plugin Steward
 
+English | [中文](README.zh.md)
+
 A DSH Web plugin that adds a **Plugin Steward** tab to the running Plugins page.
+
+## Features
 
 - Search installed profile bundles by title, package name, description, or component name.
 - Sort by name, enabled state, or update availability.
@@ -8,21 +12,68 @@ A DSH Web plugin that adds a **Plugin Steward** tab to the running Plugins page.
 - Check npm registries for newer releases and mark affected bundles with **Update available**.
 - Update an exact new version in place. If removal, download, install, or activation fails,
   the Host cleans up the failed attempt and reinstalls the previous version.
+- Preserve the bundle's enabled/disabled state across an update and report when a restart is
+  required.
+- Chinese and English interface copy.
+
+## Usage
+
+1. Open **Plugins** in the sidebar.
+2. Select the **Plugin Steward** tab.
+3. Search, sort, and filter the installed bundle list.
+4. When a bundle has an update, select **Update to vX.Y.Z**. Progress and the result appear on
+   the card.
+
+## Update and rollback
+
+The update flow is:
+
+1. Confirm from the update cache that the selected version is still `latest`.
+2. Remove the old bundle.
+3. Install the exact new version, preserving the previous enabled state.
+4. Verify the installed version.
+5. If any step fails:
+   - try to remove the failed new version;
+   - reinstall the old version;
+   - return `rolled-back` or `rollback-failed`.
+
+Every result is one of `updated`, `restart-required`, `rolled-back`, or `rollback-failed`.
+A failed rollback reports the old version and requires a manual reinstall from the official
+Plugins page.
+
+> Updates use the official plugin manager's remove-then-install flow. After a successful
+> update, the bundle rejoins the end of the profile bundle list, which can change
+> configuration precedence.
+
+## Scope
+
+- Only registry-installed, removable profile bundles are auto-updated.
+- Local paths, `link:`, Git, tarball, read-only bundles, and Plugin Steward itself are not
+  auto-updated.
+- `pluginManager.installBundle` checks compatibility with the running DSH version; a
+  failure triggers rollback.
+- Changes that need a DSH restart are reported as `restart-required` instead of claiming the
+  new code is already live.
+
+## Host routes
 
 The browser half uses the generated `pluginManager` Remote namespace for inventory and
 enablement. The Host half adds two same-origin routes:
 
-- `GET /dsh-plugin-steward/updates` — cached registry comparison, ten-minute TTL.
+- `GET /dsh-plugin-steward/updates` — cached registry comparison with a ten-minute TTL.
 - `POST /dsh-plugin-steward/update` — removes the old registry bundle, installs the exact
-  version, verifies the version, and rolls back on failure. The update route requires a
-  JSON body and the private `x-plugin-steward-update: 1` header; it refuses local, linked,
-  Git, read-only, self, and non-registry bundles. Only one update runs at a time.
+  version, verifies it, and rolls back on failure.
 
-Every update result reports the stages and either `updated`, `restart-required`,
-`rolled-back`, or `rollback-failed`. The rollback installs the exact old version with the
-same enabled state; a failed new version is removed before that rollback is attempted.
-Update checking and updating remain advisory in the sense that a running DSH process that
-needs a restart reports that requirement instead of pretending the new code is live.
+The update route requires:
+
+- a loopback Host and a same-origin request;
+- a JSON request body;
+- the private `x-plugin-steward-update: 1` header;
+- a target that is installed, removable, non-local/non-Git, not read-only, and not this
+  plugin;
+- a target version matching the cached `latest`.
+
+Only one update runs at a time.
 
 ## Files
 
@@ -31,3 +82,12 @@ needs a restart reports that requirement instead of pretending the new code is l
 - `cordis.patch.yml` — inserts the Loader row.
 - `locale/` — Plugin Manager display metadata.
 - `icon.svg` — original artwork for the plugin inventory.
+
+## Security
+
+- The update route accepts only same-origin loopback requests and requires the private
+  intent header.
+- The target version is validated against the Host's update cache; the browser cannot choose
+  an arbitrary version or registry.
+- Updates and rollbacks call the official `pluginManager` service, so compatibility checks,
+  build-script approval, and the profile write lock still apply.
