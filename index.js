@@ -20,7 +20,7 @@ const CACHE_TTL_MS = 10 * 60 * 1000
 const FETCH_TIMEOUT_MS = 7000
 const UPDATE_BODY_BYTES = 8192
 const SELF_PACKAGE = '@local/dsh-plugin-steward'
-const STEWARD_VERSION = '1.2.2'
+const STEWARD_VERSION = '1.2.3'
 const PUBLIC_REGISTRIES = new Set([
   'https://registry.npmjs.org/',
   'https://registry.npmmirror.com/',
@@ -179,10 +179,11 @@ export function apply(ctx) {
     }
 
     let wait = false
+    let asyncJob = false
     try {
       wait = new URL(req.url || '/', 'http://localhost').searchParams.get('wait') === '1'
     } catch {
-      // A malformed URL still runs the asynchronous job.
+      // A malformed URL still runs the job with the body's mode.
     }
 
     let body = null
@@ -198,6 +199,9 @@ export function apply(ctx) {
       return
     }
     if (body.wait === true) wait = true
+    // Only the 1.2.2+ client asks for a job. An older page keeps the synchronous
+    // response it expects, so a refresh is never required for correctness.
+    if (body.job === true) asyncJob = true
 
     const name = typeof body.name === 'string' ? body.name.trim() : ''
     const version = typeof body.version === 'string' ? body.version.trim() : ''
@@ -253,7 +257,7 @@ export function apply(ctx) {
       }
     })()
 
-    if (wait) {
+    if (wait || !asyncJob) {
       try {
         await run
         sendJson(res, 200, { ok: true, result: job.result })
@@ -1793,7 +1797,7 @@ function githubAccess() {
 async function githubJson(path, github) {
   const headers = {
     accept: 'application/vnd.github+json',
-    'user-agent': 'dsh-plugin-steward/1.2.2',
+    'user-agent': 'dsh-plugin-steward/1.2.3',
   }
   if (github && github.token !== null) headers.authorization = `Bearer ${github.token}`
   const response = await fetch(`${GITHUB_API}${path}`, {
@@ -1866,7 +1870,7 @@ async function fetchJson(url, accept = 'application/json', timeoutMs = FETCH_TIM
   const response = await fetch(url, {
     headers: {
       accept,
-      'user-agent': 'dsh-plugin-steward/1.2.2',
+      'user-agent': 'dsh-plugin-steward/1.2.3',
     },
     signal: AbortSignal.timeout(timeoutMs),
   })
