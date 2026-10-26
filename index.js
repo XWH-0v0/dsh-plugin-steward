@@ -9,17 +9,18 @@
  * update route additionally requires a JSON body and a private request header.
  */
 
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 const ROUTE_PATH = '/dsh-plugin-steward/updates'
 const UPDATE_ROUTE_PATH = '/dsh-plugin-steward/update'
+const STATUS_ROUTE_PATH = '/dsh-plugin-steward/update/status'
 const GITHUB_API = 'https://api.github.com'
 const CACHE_TTL_MS = 10 * 60 * 1000
 const FETCH_TIMEOUT_MS = 7000
 const UPDATE_BODY_BYTES = 8192
 const SELF_PACKAGE = '@local/dsh-plugin-steward'
-const STEWARD_VERSION = '1.2.1'
+const STEWARD_VERSION = '1.2.2'
 const PUBLIC_REGISTRIES = new Set([
   'https://registry.npmjs.org/',
   'https://registry.npmmirror.com/',
@@ -34,6 +35,16 @@ const UPDATE_CANCEL_WAIT_MS = 30 * 1000
 const UPDATE_RECOVERY_DELAY_MS = 10 * 1000
 const JOURNAL_VERSION = 1
 const JOURNAL_FILE = 'steward-pending-update.json'
+/** Live update job, persisted so a self-update reload can hand it to the new module. */
+const JOB_FILE = 'steward-update-job.json'
+const JOB_VERSION = 1
+const JOB_TTL_MS = 10 * 60 * 1000
+const JOB_POLL_MS = 500
+/** Ordered step ids; the client localizes them. */
+const JOB_STEPS = {
+  normal: ['check', 'preflight', 'journal', 'remove', 'install', 'verify', 'finish'],
+  self: ['check', 'preflight', 'journal', 'selfInstall', 'verify', 'reload'],
+}
 const EXTERNAL_SOURCE = /^(?:file|link|workspace|portal|git\+|git:|github:|gitlab:|bitbucket:|https?:|npm:)/i
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
 
@@ -50,6 +61,9 @@ export function apply(ctx) {
   let pending = null
   let generation = 0
   let updating = false
+  let restoringJob = false
+  /** @type {ReturnType<typeof createJob> | null} */
+  let currentJob = null
 
   ctx.effect(
     () => ctx.on('plugin-manager/changed', () => {
@@ -109,6 +123,39 @@ export function apply(ctx) {
     }
   }
 
+  const serveStatus = async (req, res) => {
+    if (!isTrustedRequest(req)) {
+      sendJson(res, 403, { error: 'forbidden' })
+      return
+    }
+    if (req.method !== 'GET') {
+      res.setHeader('Allow', 'GET')
+      sendJson(res, 405, { error: 'method-not-allowed' })
+      return
+    }
+    let id = ''
+    try {
+      id = new URL(req.url || '/', 'http://localhost').searchParams.get('id') || ''
+    } catch {
+      // An unreadable id is answered by the current job.
+    }
+    if (currentJob === null) {
+      const stored = await readJob(ctx)
+      if (stored !== null && stored.done && Date.now() - (stored.updatedAt || 0) <= JOB_TTL_MS) {
+        currentJob = stored
+      }
+    }
+    if (currentJob === null) {
+      sendJson(res, 404, { error: 'no-job' })
+      return
+    }
+    if (id !== '' && id !== currentJob.id) {
+      sendJson(res, 404, { error: 'job-not-found' })
+      return
+    }
+    sendJson(res, 200, { ok: true, job: jobSnapshot(currentJob) })
+  }
+
   const serveUpdate = async (req, res) => {
     if (!isTrustedRequest(req)) {
       sendJson(res, 403, { error: 'forbidden' })
@@ -130,18 +177,12 @@ export function apply(ctx) {
       sendJson(res, 415, { error: 'unsupported-media-type' })
       return
     }
-    if (updating) {
-      sendJson(res, 409, { error: 'update-in-progress' })
-      return
-    }
 
-    // Package operations can legitimately outlive the default HTTP socket
-    // timeout, and the operation owns its own rollback after a disconnect.
+    let wait = false
     try {
-      req.setTimeout?.(0)
-      res.setTimeout?.(0)
+      wait = new URL(req.url || '/', 'http://localhost').searchParams.get('wait') === '1'
     } catch {
-      // Timeout helpers are best-effort on alternative carriers.
+      // A malformed URL still runs the asynchronous job.
     }
 
     let body = null
@@ -156,6 +197,7 @@ export function apply(ctx) {
       sendJson(res, 400, { error: 'invalid-body' })
       return
     }
+    if (body.wait === true) wait = true
 
     const name = typeof body.name === 'string' ? body.name.trim() : ''
     const version = typeof body.version === 'string' ? body.version.trim() : ''
@@ -163,38 +205,80 @@ export function apply(ctx) {
       sendJson(res, 400, { error: 'invalid-target' })
       return
     }
-    if (updating) {
+    if (updating || restoringJob) {
       sendJson(res, 409, { error: 'update-in-progress' })
       return
     }
-
-    updating = true
-    try {
-      const result = await performUpdate(ctx, load, name, version)
-      sendJson(res, 200, { ok: true, result })
-    } catch (error) {
-      const expected = error?.code === 'invalid-target' || error?.code === 'not-updatable'
-        || error?.code === 'version-changed' || error?.code === 'not-installed'
-        || error?.code === 'read-only' || error?.code === 'external-source'
-        || error?.code === 'network' || error?.code === 'timeout'
-        || error?.code === 'pending-recovery' || error?.code === 'journal-failed'
-      if (!expected) {
-        try {
-          ctx.logger?.error?.(error)
-        } catch {
-          // Keep the response path independent from logging.
-        }
-      }
-      const status = expected ? 409 : 500
-      const detail = truncate(messageOf(error), 600)
-      sendJson(res, status, {
-        error: error?.code || 'update-failed',
-        detail,
-        reason: detail,
-      })
-    } finally {
-      updating = false
+    if (currentJob !== null && !currentJob.done
+      && Date.now() - (currentJob.updatedAt || 0) < 30 * 60 * 1000) {
+      sendJson(res, 409, { error: 'update-in-progress' })
+      return
     }
+    if (currentJob !== null) {
+      await clearJob(ctx)
+      currentJob = null
+    }
+
+    // Package operations can legitimately outlive the default HTTP socket
+    // timeout; the asynchronous job owns its own rollback after a disconnect.
+    try {
+      req.setTimeout?.(0)
+      res.setTimeout?.(0)
+    } catch {
+      // Timeout helpers are best-effort on alternative carriers.
+    }
+
+    const job = createJob({
+      name,
+      version,
+      fromVersion: null,
+      self: name === SELF_PACKAGE,
+    })
+    currentJob = job
+    updating = true
+    await persistJob(ctx, job)
+
+    const run = (async () => {
+      try {
+        const result = await performUpdate(ctx, load, name, version, job)
+        finishJob(job, result)
+        await persistJob(ctx, job)
+        return result
+      } catch (error) {
+        failJob(job, error)
+        await persistJob(ctx, job)
+        throw error
+      } finally {
+        updating = false
+      }
+    })()
+
+    if (wait) {
+      try {
+        await run
+        sendJson(res, 200, { ok: true, result: job.result })
+      } catch (error) {
+        if (!isExpectedUpdateError(error)) {
+          try {
+            ctx.logger?.error?.(error)
+          } catch {
+            // Keep the response path independent from logging.
+          }
+        }
+        const detail = truncate(messageOf(error), 600)
+        sendJson(res, isExpectedUpdateError(error) ? 409 : 500, {
+          error: error?.code || 'update-failed',
+          detail,
+          reason: detail,
+        })
+      }
+      return
+    }
+
+    // A browser refresh or a self-update reload must not turn into an
+    // unhandled rejection; the result is read from the status route.
+    run.catch(() => {})
+    sendJson(res, 202, { ok: true, jobId: job.id, job: jobSnapshot(job) })
   }
 
   ctx.inject(['webServer'], (webCtx) => {
@@ -214,7 +298,68 @@ export function apply(ctx) {
       }),
       'dsh-plugin-steward: update action route',
     )
+    webCtx.effect(
+      () => webCtx.webServer.register({
+        kind: 'exact',
+        path: STATUS_ROUTE_PATH,
+        handler: serveStatus,
+      }),
+      'dsh-plugin-steward: update status route',
+    )
   })
+
+  const restoreJobState = async () => {
+    if (currentJob !== null || updating) return
+    restoringJob = true
+    try {
+      const saved = await readJob(ctx)
+      if (saved === null) return
+      if (saved.done) {
+        if (Date.now() - (saved.updatedAt || 0) > JOB_TTL_MS) {
+          await clearJob(ctx)
+          return
+        }
+        currentJob = saved
+        return
+      }
+      if (Date.now() - (saved.startedAt || 0) > 30 * 60 * 1000) {
+        await clearJob(ctx)
+        return
+      }
+      let bundle = null
+      try {
+        bundle = await findInstalledBundle(ctx, saved.name)
+      } catch {
+        bundle = null
+      }
+      const result = inferJobResult(saved, bundle)
+      const job = {
+        ...saved,
+        done: true,
+        phase: result.status === 'failed' ? 'failed' : 'done',
+        result,
+        error: result.failure || null,
+        updatedAt: Date.now(),
+      }
+      if (job.phase === 'done') {
+        job.step = job.steps.length - 1
+        for (const step of job.steps) step.state = 'done'
+      } else {
+        const active = job.steps.find((step) => step.state === 'active')
+        if (active !== undefined) active.state = 'error'
+      }
+      currentJob = job
+      await persistJob(ctx, job)
+    } finally {
+      restoringJob = false
+    }
+  }
+
+  ctx.effect(() => {
+    const timer = setTimeout(() => { void restoreJobState() }, 1200)
+    if (typeof timer.unref === 'function') timer.unref()
+    return () => clearTimeout(timer)
+  }, 'dsh-plugin-steward: restore an update job after a reload')
 
   // An update that is interrupted between removeBundle and installBundle would
   // otherwise leave the plugin deleted. The journal is written before removal
@@ -258,6 +403,16 @@ export function apply(ctx) {
       )
       if (rollback.restored) {
         await clearJournal(ctx)
+        if (currentJob !== null && !currentJob.done && currentJob.name === record.name) {
+          finishJob(currentJob, {
+            status: 'rolled-back',
+            name: record.name,
+            fromVersion: record.fromVersion,
+            toVersion: currentJob.version,
+            reason: 'The interrupted update was rolled back at startup.',
+          })
+          await persistJob(ctx, currentJob)
+        }
         try {
           ctx.logger?.info?.(`dsh-plugin-steward: restored ${record.name}@${record.fromVersion} after an interrupted update`)
         } catch {
@@ -288,7 +443,8 @@ export function apply(ctx) {
  * authority for the target version, so the browser cannot ask for an arbitrary
  * package, registry, or downgrade.
  */
-async function performUpdate(ctx, load, name, requestedVersion) {
+async function performUpdate(ctx, load, name, requestedVersion, job) {
+  if (job) advanceJob(job, 'check', 'check', 'Checking the installed version…')
   const updates = await load(false)
   const info = updates?.packages?.[name]
   if (!info || info.status !== 'update') {
@@ -309,11 +465,12 @@ async function performUpdate(ctx, load, name, requestedVersion) {
   if (!bundle || bundle.installed !== true || bundle.availability !== 'profile') {
     throw updateProblem('not-installed', 'The bundle is not installed from the profile.')
   }
-  if (bundle.name === SELF_PACKAGE) {
-    throw updateProblem('read-only', 'Plugin Steward does not update itself.')
-  }
-  if (bundle.readOnlyReason !== undefined || bundle.removable !== true) {
+  const isSelf = bundle.name === SELF_PACKAGE
+  if (bundle.readOnlyReason !== undefined || (!isSelf && bundle.removable !== true)) {
     throw updateProblem('read-only', 'The plugin manager does not allow this bundle to be updated.')
+  }
+  if (isSelf && info.provider !== 'github') {
+    throw updateProblem('read-only', 'Self-update is supported only when Plugin Steward is installed from GitHub.')
   }
   if (bundle.version !== fromVersion) {
     throw updateProblem('version-changed', 'The installed version changed; check for updates again.')
@@ -365,6 +522,19 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     : (typeof info.registry === 'string' && /^https?:\/\//i.test(info.registry) ? info.registry : undefined)
   const baseInstallArgs = isGitHub ? { enabled, saveExact: true } : installOptions(enabled, registry)
 
+  if (job) {
+    job.fromVersion = fromVersion
+    job.provider = isGitHub ? 'github' : 'registry'
+    job.self = isSelf
+    advanceJob(
+      job,
+      'preflight',
+      'preflight',
+      isGitHub ? 'Checking the GitHub release source…' : 'Probing the download registries…',
+    )
+    await persistJob(ctx, job)
+  }
+
   // Ask each candidate registry for the exact tarball before touching the
   // profile. A registry that cannot serve the tarball is skipped, and when no
   // candidate answers the update fails with the old version still installed.
@@ -372,23 +542,38 @@ async function performUpdate(ctx, load, name, requestedVersion) {
   // harmless refusal.
   const registries = isGitHub
     ? []
-    : await planInstallRegistries(ctx, name, requestedVersion, info)
+    : await planInstallRegistries(ctx, name, requestedVersion, info, job)
   if (!isGitHub && registries.length === 0) {
     throw updateProblem('network', 'No registry answered the update check; the installed version was left unchanged.')
   }
+  if (isGitHub) {
+    if (job) {
+      job.detail = 'Checking the GitHub release source…'
+      job.updatedAt = Date.now()
+    }
+    if (!await preflightGitHubSource(info.repo, info.releaseTag)) {
+      throw updateProblem('network', 'The GitHub release source did not answer; the installed version was left unchanged.')
+    }
+  }
 
+  if (job) {
+    advanceJob(job, 'journal', 'journal', 'Writing the recovery journal…')
+    await persistJob(ctx, job)
+  }
   const journal = {
     version: JOURNAL_VERSION,
     name,
     fromVersion,
     toVersion: requestedVersion,
     provider: isGitHub ? 'github' : 'registry',
+    mode: isSelf ? 'self' : 'remove-install',
+    self: isSelf,
     installSpec,
     rollbackSpecs,
     installArgs: baseInstallArgs,
     registries,
     startedAt: new Date().toISOString(),
-    stage: 'removing',
+    stage: isSelf ? 'self-installing' : 'removing',
   }
   if (!await writeJournal(ctx, journal)) {
     throw updateProblem('journal-failed', 'The update journal could not be written; nothing was changed.')
@@ -400,22 +585,45 @@ async function performUpdate(ctx, load, name, requestedVersion) {
   let removedChange = null
 
   try {
-    const removed = await ctx.pluginManager.removeBundle(name)
-    removedChange = removed
-    stages.push(stageOf('remove', removed))
-    if (!removalAccepted(removed)) {
-      throw updateProblem('remove-failed', changeReason(removed))
+    if (!isSelf) {
+      if (job) {
+        advanceJob(job, 'removing', 'remove', 'Removing the old version…')
+        await persistJob(ctx, job)
+      }
+      const removed = await ctx.pluginManager.removeBundle(name)
+      removedChange = removed
+      stages.push(stageOf('remove', removed))
+      if (!removalAccepted(removed)) {
+        throw updateProblem('remove-failed', changeReason(removed))
+      }
+      // A running host module can be removed from the profile now but stay in
+      // memory until the next start. That is a deferred success, not a failure:
+      // continue installing the new version so the restart picks it up.
+      deferredRemoval = removed.application === 'restart-required'
+      journal.stage = 'removed'
+      await writeJournal(ctx, journal)
+    } else if (job) {
+      advanceJob(
+        job,
+        'self-installing',
+        'selfInstall',
+        'Installing the new version in place; self-update never removes the running plugin…',
+      )
+      await persistJob(ctx, job)
     }
-    // A running host module can be removed from the profile now but stay in
-    // memory until the next start. That is a deferred success, not a failure:
-    // continue installing the new version so the restart picks it up.
-    deferredRemoval = removed.application === 'restart-required'
-    journal.stage = 'removed'
-    await writeJournal(ctx, journal)
 
     journal.stage = 'installing'
     await writeJournal(ctx, journal)
-    const attempt = await installVersion(ctx, installSpec, baseInstallArgs, registries, stages, 'install')
+    if (job) {
+      advanceJob(
+        job,
+        'installing',
+        isSelf ? 'selfInstall' : 'install',
+        isSelf ? 'Installing the new version in place…' : 'Installing the new version…',
+      )
+      await persistJob(ctx, job)
+    }
+    const attempt = await installVersion(ctx, installSpec, baseInstallArgs, registries, stages, 'install', job)
     const installed = attempt.change
     if (installed === null || !installSucceeded(installed)) {
       throw attempt.error || updateProblem('install-failed', 'The new version could not be installed.')
@@ -423,8 +631,17 @@ async function performUpdate(ctx, load, name, requestedVersion) {
 
     journal.stage = 'verifying'
     await writeJournal(ctx, journal)
-    const current = await findInstalledBundle(ctx, name)
-    if (current?.version !== requestedVersion && installed.version !== requestedVersion) {
+    if (job) {
+      advanceJob(job, 'verifying', 'verify', 'Verifying the installed version…')
+      await persistJob(ctx, job)
+    }
+    let current = null
+    try {
+      current = await findInstalledBundle(ctx, name)
+    } catch {
+      // A self-update may dispose this context mid-call; the install already succeeded.
+    }
+    if (current !== null && current?.version !== requestedVersion && installed.version !== requestedVersion) {
       throw updateProblem('verify-failed', 'The installed version did not become the requested version.')
     }
 
@@ -480,7 +697,7 @@ async function performUpdate(ctx, load, name, requestedVersion) {
   if (current?.installed === true && current.version === requestedVersion) {
     await clearJournal(ctx)
     return {
-      status: 'restart-required',
+      status: isSelf ? 'updated' : 'restart-required',
       provider: isGitHub ? 'github' : 'registry',
       repo: githubRepo,
       releaseTag: isGitHub && typeof info.releaseTag === 'string' ? info.releaseTag : null,
@@ -490,13 +707,22 @@ async function performUpdate(ctx, load, name, requestedVersion) {
       toVersion: requestedVersion,
       enabled,
       registry: registry || null,
-      restartRequired: true,
+      restartRequired: !isSelf,
       stages,
     }
   }
 
   // The old version is gone. Reinstall it through the same preflighted
   // registries, and keep the journal until the profile is known-good again.
+  if (job) {
+    advanceJob(
+      job,
+      'rolling-back',
+      isSelf ? 'selfInstall' : 'install',
+      'Recovering the old version…',
+    )
+    await persistJob(ctx, job)
+  }
   journal.stage = 'rolling-back'
   journal.error = truncate(messageOf(failure), 600)
   await writeJournal(ctx, journal)
@@ -509,6 +735,7 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     baseInstallArgs,
     registries,
     stages,
+    job,
   )
 
   if (rollback.restored) {
@@ -560,10 +787,11 @@ async function findInstalledBundle(ctx, name) {
 }
 
 /** Try one install spec against each preflighted registry, stopping at the first success. */
-async function installVersion(ctx, spec, baseInstallArgs, registries, stages, prefix) {
+async function installVersion(ctx, spec, baseInstallArgs, registries, stages, prefix, job) {
   const candidates = registries.length > 0 ? registries : [null]
   let lastError = null
   let lastChange = null
+  const rollingBack = typeof prefix === 'string' && prefix.startsWith('rollback')
 
   for (let index = 0; index < candidates.length; index += 1) {
     const registry = candidates[index]
@@ -571,13 +799,27 @@ async function installVersion(ctx, spec, baseInstallArgs, registries, stages, pr
     const args = { ...baseInstallArgs }
     if (typeof registry === 'string' && registry !== '') args.registry = registry
 
+    if (job) {
+      job.detail = `${rollingBack ? 'Reinstalling the old version' : 'Installing the new version'} from ${registry || 'the configured source'}…`
+      job.attempt = {
+        registry: typeof registry === 'string' ? registry : 'default',
+        index: index + 1,
+        total: candidates.length,
+      }
+      job.updatedAt = Date.now()
+    }
+
     try {
-      const change = await installWithDeadline(
+      const change = await watchInstallLog(
         ctx,
-        spec,
-        args,
-        newRequestId(),
-        envDuration('DSH_PLUGIN_STEWARD_ATTEMPT_TIMEOUT_MS', UPDATE_ATTEMPT_TIMEOUT_MS),
+        job,
+        () => installWithDeadline(
+          ctx,
+          spec,
+          args,
+          newRequestId(),
+          envDuration('DSH_PLUGIN_STEWARD_ATTEMPT_TIMEOUT_MS', UPDATE_ATTEMPT_TIMEOUT_MS),
+        ),
       )
       const stage = stageOf(stageName, change)
       stage.registry = typeof registry === 'string' ? registry : 'default'
@@ -671,7 +913,7 @@ async function installWithDeadline(ctx, spec, options, requestId, timeoutMs) {
 }
 
 /** Put the version the user had before the update back on disk. */
-async function restoreOldVersion(ctx, name, fromVersion, rollbackSpecs, installArgs, registries, stages) {
+async function restoreOldVersion(ctx, name, fromVersion, rollbackSpecs, installArgs, registries, stages, job) {
   let current = null
   try {
     current = await findInstalledBundle(ctx, name)
@@ -685,7 +927,7 @@ async function restoreOldVersion(ctx, name, fromVersion, rollbackSpecs, installA
   let lastError = null
   for (let index = 0; index < rollbackSpecs.length; index += 1) {
     const prefix = index === 0 ? 'rollback' : `rollback-${index + 1}`
-    const attempt = await installVersion(ctx, rollbackSpecs[index], installArgs, registries, stages, prefix)
+    const attempt = await installVersion(ctx, rollbackSpecs[index], installArgs, registries, stages, prefix, job)
     if (attempt.change !== null && installSucceeded(attempt.change)) {
       try {
         const after = await findInstalledBundle(ctx, name)
@@ -710,7 +952,7 @@ async function restoreOldVersion(ctx, name, fromVersion, rollbackSpecs, installA
  * exact tarball before the old version is removed; a private registry is
  * asked alone so its package names never reach a public fallback.
  */
-async function planInstallRegistries(ctx, name, version, info) {
+async function planInstallRegistries(ctx, name, version, info, job) {
   const configured = await registryConfig(ctx)
   const candidates = []
   const add = (value) => {
@@ -734,11 +976,23 @@ async function planInstallRegistries(ctx, name, version, info) {
   const unprobed = []
   for (let index = 0; index < candidates.length; index += 1) {
     const registry = candidates[index]
+    if (job) {
+      job.detail = `Checking ${registry}…`
+      job.updatedAt = Date.now()
+    }
     const state = await preflightRegistry(registry, name, version)
     if (state === 'ok') {
+      if (job) {
+        job.detail = `${registry} can serve the update.`
+        job.updatedAt = Date.now()
+      }
       ordered.push(registry)
       unprobed.push(...candidates.slice(index + 1))
       break
+    }
+    if (job) {
+      job.detail = `${registry} did not answer; trying another source…`
+      job.updatedAt = Date.now()
     }
     if (state === 'unknown' && !isPublicRegistryUrl(registry)) unprobed.push(registry)
   }
@@ -807,6 +1061,33 @@ async function preflightRegistry(registry, name, version) {
   }
 }
 
+/**
+ * Check that the release source can be fetched before a GitHub update touches
+ * the profile. The install itself uses a Git spec, but codeload is the same
+ * release content and answers a cheap HEAD.
+ */
+async function preflightGitHubSource(repo, releaseTag) {
+  if (typeof repo !== 'string' || typeof releaseTag !== 'string' || releaseTag === '') return false
+  const [owner, name] = repo.split('/')
+  if (typeof owner !== 'string' || owner === '' || typeof name !== 'string' || name === '') return false
+  const url = `https://codeload.github.com/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`
+    + `/tar.gz/refs/tags/${encodeURIComponent(releaseTag)}`
+  const controller = new AbortController()
+  const timer = setTimeout(
+    () => controller.abort(),
+    envDuration('DSH_PLUGIN_STEWARD_PREFLIGHT_TIMEOUT_MS', UPDATE_PREFLIGHT_TIMEOUT_MS),
+  )
+  if (typeof timer.unref === 'function') timer.unref()
+  try {
+    const response = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: controller.signal })
+    return response.ok || response.status === 405
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 function normalizeRegistryUrl(value) {
   return `${String(value).trim().replace(/\/+$/, '')}/`
 }
@@ -834,7 +1115,7 @@ function withTimeout(promise, ms) {
   })
 }
 
-function journalTarget(ctx) {
+function profileDirectory(ctx) {
   const candidates = []
   try {
     const profile = typeof ctx?.get === 'function' ? ctx.get('profileContext') : undefined
@@ -848,9 +1129,21 @@ function journalTarget(ctx) {
     // Fall through to the environment.
   }
   if (typeof process.env.DSH_PROFILE_DIR === 'string') candidates.push(process.env.DSH_PROFILE_DIR)
-  const dir = candidates.find((value) => typeof value === 'string' && value !== '')
-  if (dir === undefined) return null
-  return join(dir, '.plugin-manager', JOURNAL_FILE)
+  return candidates.find((value) => typeof value === 'string' && value !== '') ?? null
+}
+
+function stateTarget(ctx, file) {
+  const dir = profileDirectory(ctx)
+  if (dir === null) return null
+  return join(dir, '.plugin-manager', file)
+}
+
+function journalTarget(ctx) {
+  return stateTarget(ctx, JOURNAL_FILE)
+}
+
+function jobTarget(ctx) {
+  return stateTarget(ctx, JOB_FILE)
 }
 
 async function writeJournal(ctx, record) {
@@ -896,10 +1189,228 @@ async function clearJournal(ctx) {
   }
 }
 
+/** A live update job shown by the tab while the plugin manager works. */
+function createJob({ name, version, fromVersion, self }) {
+  const ids = self ? JOB_STEPS.self : JOB_STEPS.normal
+  return {
+    schema: JOB_VERSION,
+    id: `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    version,
+    fromVersion,
+    self: self === true,
+    phase: 'check',
+    step: 0,
+    steps: ids.map((id, index) => ({ id, state: index === 0 ? 'active' : 'pending' })),
+    detail: '',
+    logTail: [],
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+    done: false,
+    result: null,
+    error: null,
+  }
+}
+
+function advanceJob(job, phase, stepId, detail) {
+  if (job === null || job === undefined) return
+  if (typeof stepId === 'string') {
+    const index = job.steps.findIndex((step) => step.id === stepId)
+    if (index >= 0) {
+      job.step = index
+      job.steps.forEach((step, position) => {
+        if (position < index) step.state = 'done'
+        else if (position === index) step.state = 'active'
+        else if (step.state !== 'error') step.state = 'pending'
+      })
+    }
+  }
+  if (typeof detail === 'string' && detail !== '') job.detail = truncate(detail, 300)
+  job.phase = phase
+  job.updatedAt = Date.now()
+}
+
+function finishJob(job, result) {
+  if (job === null || job === undefined) return
+  job.done = true
+  job.phase = 'done'
+  job.result = result
+  job.error = null
+  job.updatedAt = Date.now()
+  job.step = job.steps.length - 1
+  for (const step of job.steps) step.state = 'done'
+}
+
+function failJob(job, error) {
+  if (job === null || job === undefined) return
+  job.done = true
+  job.phase = 'failed'
+  job.updatedAt = Date.now()
+  const failure = problemOf(error)
+  job.error = failure
+  job.result = {
+    status: 'failed',
+    name: job.name,
+    fromVersion: job.fromVersion,
+    toVersion: job.version,
+    reason: messageOf(error),
+    failure,
+  }
+  const active = job.steps.find((step) => step.state === 'active')
+  if (active !== undefined) active.state = 'error'
+}
+
+function jobSnapshot(job) {
+  return {
+    ...job,
+    elapsedMs: Math.max(0, Date.now() - job.startedAt),
+    steps: job.steps.map((step) => ({ ...step })),
+    logTail: Array.isArray(job.logTail) ? job.logTail.slice(-6) : [],
+  }
+}
+
+async function persistJob(ctx, job) {
+  const target = jobTarget(ctx)
+  if (target === null) return false
+  const temp = `${target}.${process.pid}.tmp`
+  try {
+    await mkdir(dirname(target), { recursive: true })
+    await writeFile(temp, JSON.stringify(jobSnapshot(job), null, 2), 'utf8')
+    await rename(temp, target)
+    return true
+  } catch (error) {
+    try {
+      ctx.logger?.warn?.('dsh-plugin-steward: could not persist the update job', error)
+    } catch {
+      // The live status route still works; only the reload handoff is lost.
+    }
+    return false
+  }
+}
+
+async function readJob(ctx) {
+  const target = jobTarget(ctx)
+  if (target === null) return null
+  try {
+    const job = JSON.parse(await readFile(target, 'utf8'))
+    if (job === null || typeof job !== 'object') return null
+    if (job.schema !== JOB_VERSION) return null
+    if (typeof job.id !== 'string' || typeof job.name !== 'string' || typeof job.version !== 'string') return null
+    if (!Array.isArray(job.steps)) return null
+    return job
+  } catch {
+    return null
+  }
+}
+
+async function clearJob(ctx) {
+  const target = jobTarget(ctx)
+  if (target === null) return
+  try {
+    await rm(target, { force: true })
+  } catch {
+    // A stale job is harmless; the next start replaces or expires it.
+  }
+}
+
+/** Infer the result of a job whose plugin reloaded before it reported back. */
+function inferJobResult(job, bundle) {
+  const base = {
+    name: job.name,
+    fromVersion: job.fromVersion,
+    toVersion: job.version,
+    provider: job.self ? 'github' : undefined,
+  }
+  if (bundle?.installed === true && bundle.version === job.version) {
+    return {
+      ...base,
+      status: job.self ? 'updated' : 'restart-required',
+      inferred: true,
+      reason: 'The plugin reloaded before the update reported a result; the target version is installed.',
+    }
+  }
+  if (bundle?.installed === true && bundle.version === job.fromVersion) {
+    return {
+      ...base,
+      status: 'failed',
+      keptVersion: job.fromVersion,
+      reason: 'The plugin reloaded before the update reported a result; the old version is still installed.',
+      failure: { code: 'interrupted', detail: 'The update did not report a result before the plugin reloaded.' },
+    }
+  }
+  return {
+    ...base,
+    status: 'failed',
+    reason: 'The update was interrupted before it reported a result.',
+    failure: { code: 'interrupted', detail: 'The update did not report a result before its plugin stopped.' },
+  }
+}
+
+/**
+ * Stream the newest pnpm operation log into the job while an install runs.
+ * The plugin manager writes `.plugin-manager/logs/operation-<id>/pnpm.log`, so the
+ * tab can show real download/resolve lines without a second event channel.
+ */
+async function watchInstallLog(ctx, job, run) {
+  if (job === null || job === undefined) return run()
+  const dir = profileDirectory(ctx)
+  if (dir === null) return run()
+  const logsDir = join(dir, '.plugin-manager', 'logs')
+  let before = new Set()
+  try {
+    before = new Set(await readdir(logsDir))
+  } catch {
+    // The first operation creates the directory later.
+  }
+  let stopped = false
+  const timer = setInterval(async () => {
+    if (stopped) return
+    try {
+      const entries = await readdir(logsDir)
+      const fresh = entries
+        .filter((entry) => !before.has(entry) && entry.startsWith('operation-'))
+        .sort()
+      const newest = fresh[fresh.length - 1]
+      if (newest === undefined) return
+      const text = await readFile(join(logsDir, newest, 'pnpm.log'), 'utf8')
+      const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+      if (lines.length === 0) return
+      job.logTail = lines.slice(-4).map((line) => truncate(stripAnsi(line), 280))
+      const progress = [...lines].reverse().find((line) => (
+        /Progress:|Packages:|ERR_|WARN|Done in|dsh:/.test(line)
+      ))
+      if (progress !== undefined) job.detail = truncate(stripAnsi(progress), 240)
+      job.updatedAt = Date.now()
+    } catch {
+      // The operation log may not exist yet; the next poll retries.
+    }
+  }, JOB_POLL_MS)
+  if (typeof timer.unref === 'function') timer.unref()
+  try {
+    return await run()
+  } finally {
+    stopped = true
+    clearInterval(timer)
+  }
+}
+
+function stripAnsi(value) {
+  return String(value).replace(/\x1b\[[0-9;]*m/g, '')
+}
+
 function updateProblem(code, detail) {
   const error = new Error(detail)
   error.code = code
   return error
+}
+
+function isExpectedUpdateError(error) {
+  const code = error?.code
+  return code === 'invalid-target' || code === 'not-updatable'
+    || code === 'version-changed' || code === 'not-installed'
+    || code === 'read-only' || code === 'external-source'
+    || code === 'network' || code === 'timeout'
+    || code === 'pending-recovery' || code === 'journal-failed'
 }
 
 function installOptions(enabled, registry) {
@@ -1005,14 +1516,17 @@ async function computeUpdates(ctx) {
   const installed = all.filter((bundle) => (
     bundle.installed === true
     && bundle.availability === 'profile'
-    && bundle.name !== SELF_PACKAGE
   ))
   const registries = await registryUrls(ctx)
   const github = githubAccess()
   const packages = {}
 
   await Promise.all(installed.map(async (bundle) => {
-    packages[bundle.name] = await inspectBundle(bundle, registries, github)
+    const info = await inspectBundle(bundle, registries, github)
+    packages[bundle.name] = {
+      ...info,
+      self: bundle.name === SELF_PACKAGE,
+    }
   }))
 
   return {
@@ -1279,7 +1793,7 @@ function githubAccess() {
 async function githubJson(path, github) {
   const headers = {
     accept: 'application/vnd.github+json',
-    'user-agent': 'dsh-plugin-steward/1.2.1',
+    'user-agent': 'dsh-plugin-steward/1.2.2',
   }
   if (github && github.token !== null) headers.authorization = `Bearer ${github.token}`
   const response = await fetch(`${GITHUB_API}${path}`, {
@@ -1352,7 +1866,7 @@ async function fetchJson(url, accept = 'application/json', timeoutMs = FETCH_TIM
   const response = await fetch(url, {
     headers: {
       accept,
-      'user-agent': 'dsh-plugin-steward/1.2.1',
+      'user-agent': 'dsh-plugin-steward/1.2.2',
     },
     signal: AbortSignal.timeout(timeoutMs),
   })

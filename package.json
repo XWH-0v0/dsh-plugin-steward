@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-plugin-steward",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "type": "module",
-  "description": "Plugin Steward: search, sort, and switch installed DSH plugins, with npm and GitHub Release update checks, detailed failure reasons, and automatic rollback.",
+  "description": "Plugin Steward: search, sort, and switch installed DSH plugins, with npm and GitHub Release update checks, live step-by-step progress, detailed failure reasons, and safe self-update.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

@@ -11,8 +11,12 @@ A DSH Web plugin that adds a **Plugin Steward** tab to the running Plugins page.
 - Switch a whole bundle on or off, or switch one of its loader rows independently.
 - Check npm registries and GitHub Releases for newer releases, and mark affected bundles
   with **Update available**.
-- Update an exact new version in place. If removal, download, install, or activation fails,
-  the Host cleans up the failed attempt and reinstalls the previous version.
+- Show live progress while an update runs: the current step, elapsed time, the newest pnpm
+  line, and a short log tail.
+- Update an exact new version. If preflight, download, install, or activation fails, the Host
+  restores the previous version and keeps a recovery journal for an interrupted process.
+- Self-update from a GitHub install: Plugin Steward installs the new tag **in place**, without
+  removing the running plugin, so a failed self-update cannot leave it deleted.
 - Preserve the bundle's enabled/disabled state across an update and report when a restart is
   required.
 - Chinese and English interface copy.
@@ -33,8 +37,11 @@ The update flow is:
 2. For registry packages, probe the exact tarball on each candidate registry before touching
    the profile. If no registry can serve it, fail with `network` and leave the old version
    installed.
-3. Write a recovery journal (`.plugin-manager/steward-pending-update.json`).
-4. Remove the old bundle.
+3. Write a recovery journal (`.plugin-manager/steward-pending-update.json`) and start a
+   persisted job. The tab polls `GET /dsh-plugin-steward/update/status` for the current step,
+   elapsed time, the newest pnpm line, and a short log tail.
+4. For an ordinary bundle, remove the old bundle. For Plugin Steward's own GitHub self-update,
+   skip this step: install the new tag in place, without removing the running plugin.
 5. Install the exact new version, preserving the previous enabled state. Each registry gets a
    bounded attempt; a stalled run is cancelled through the plugin manager instead of waiting
    for its ten-minute silence timeout.
@@ -62,10 +69,12 @@ returned by the update service, the rollback status, and optional stage diagnost
 reason can be copied for a bug report. Failed results include a top-level `reason`, a
 `failure` object with the original error, and `rollbackReason` when rollback failed.
 
-> Updates use the official plugin manager's remove-then-install flow because a live profile
-> with HMR refuses to install over an existing dependency (`already-installed`). After a
-> successful update, the bundle rejoins the end of the profile bundle list, which can change
-> configuration precedence.
+> Ordinary updates use the official plugin manager's remove-then-install flow because a live
+> profile with HMR refuses to install over an existing dependency (`already-installed`).
+> Self-update is the exception: its Git spec cannot be matched to the existing dependency
+> name, so the manager updates that dependency in place. After a successful ordinary update,
+> the bundle rejoins the end of the profile bundle list, which can change configuration
+> precedence.
 
 ## Update sources
 
@@ -77,8 +86,9 @@ reason can be copied for a bug report. Failed results include a top-level `reaso
 - Public GitHub repositories work without credentials. For a private repository or higher
   rate limits, set `GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_PAT` in the Host environment. The
   Git install itself still needs Git credentials configured for the Host.
-- Local paths, `link:`, GitHub sources without a SemVer release, tarball installs, read-only
-  bundles, and Plugin Steward itself are not auto-updated.
+- Local paths, `link:`, GitHub sources without a SemVer release, tarball installs, and read-only
+  bundles are not auto-updated. Plugin Steward itself is auto-updated only when it is installed
+  from a GitHub source.
 - `pluginManager.installBundle` checks compatibility with the running DSH version; a
   failure triggers rollback.
 - Changes that need a DSH restart are reported as `restart-required` instead of claiming the
@@ -91,9 +101,12 @@ enablement. The Host half adds two same-origin routes:
 
 - `GET /dsh-plugin-steward/updates` — cached npm/GitHub Release comparison with a ten-minute
   TTL; includes a `steward.version` field for diagnostics.
-- `POST /dsh-plugin-steward/update` — preflights the target tarball, writes the recovery
-  journal, removes the old bundle, installs the exact npm or GitHub Release target with
-  bounded registry attempts, verifies it, and restores the old version on failure.
+- `POST /dsh-plugin-steward/update` — starts the update job (or `?wait=1` for a synchronous
+  result). It preflights the target tarball, writes the recovery journal, installs the exact
+  npm or GitHub Release target with bounded registry attempts, verifies it, and restores the
+  old version on failure.
+- `GET /dsh-plugin-steward/update/status?id=…` — the live job: current step, elapsed time,
+  latest pnpm line, log tail, and the final result.
 
 The update route requires:
 

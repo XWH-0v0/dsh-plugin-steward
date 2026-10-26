@@ -10,8 +10,11 @@
 - 按名称、启用状态或更新状态排序。
 - 一键开启/关闭整个 bundle，也可以单独控制它的 Loader row。
 - 从 npm registry 或 GitHub Releases 检查新版本，在卡片上显示「可更新」标签。
-- 点击「更新到 vX.Y.Z」直接安装精确的新版本。
-- 新版本在移除、下载、安装或激活阶段失败时，自动清理失败版本并重装旧版本。
+- 更新时实时显示进度：当前步骤、已用时间、最新 pnpm 输出和短日志。
+- 点击「更新到 vX.Y.Z」安装精确的新版本；预检、下载、安装或激活失败时恢复旧版本，
+  并保留恢复日志处理进程中断。
+- GitHub 安装的插件管家支持**自我更新**：新版本**原地安装**，不会先删除正在运行的自己，
+  所以自我更新失败也不会把自己弄丢。
 - 更新会保留原 bundle 的启用/停用状态；需要重启时会明确提示。
 - 支持中文和英文界面。
 
@@ -29,8 +32,10 @@
 1. 从更新缓存确认点击的版本仍是该插件的 `latest`；
 2. 对 registry 包，先对候选 registry 探测目标 tarball；如果所有 registry 都不可用，
    返回 `network`，旧版本保持安装、不做任何改动；
-3. 写入恢复日志（`.plugin-manager/steward-pending-update.json`）；
-4. 移除旧版本 bundle；
+3. 写入恢复日志（`.plugin-manager/steward-pending-update.json`），并启动一个持久化任务；
+   卡片轮询 `GET /dsh-plugin-steward/update/status`，实时显示当前步骤、已用时间、
+   最新 pnpm 输出和短日志；
+4. 普通 bundle：移除旧版本；插件管家自己的 GitHub 自我更新：**跳过移除**，原地安装新 tag；
 5. 安装精确的新版本，并保留原来的启用状态；每个 registry 的安装都有超时上限，
    卡住的安装会通过插件管理器取消，而不是等它自己的十分钟静默超时；
 6. 校验实际安装版本，成功后删除恢复日志；
@@ -53,9 +58,10 @@
 状态和可选的阶段诊断。原因可以一键复制，方便反馈问题。失败结果会包含顶层 `reason`、
 原始 `failure` 对象，以及回滚失败时的 `rollbackReason`。
 
-> 更新沿用官方插件管理的「移除 + 安装」流程，因为带 HMR 的运行中 profile 会拒绝在
-> 已有依赖上直接安装（`already-installed`）。因此更新成功后，该 bundle 会重新排到
-> profile bundle 列表末尾，可能影响配置覆盖顺序。
+> 普通更新沿用官方插件管理的「移除 + 安装」流程，因为带 HMR 的运行中 profile 会拒绝在
+> 已有依赖上直接安装（`already-installed`）。**自我更新是例外**：它的 Git spec 无法与
+> 已有依赖名匹配，因此管理器会直接在原依赖上安装，不会先删除自己。普通更新成功后，
+> 该 bundle 会重新排到 profile bundle 列表末尾，可能影响配置覆盖顺序。
 
 ## 更新来源
 
@@ -66,8 +72,8 @@
 - 不会下载 GitHub Release 附件，而是安装 release tag 指向的源码。
 - 公开 GitHub 仓库无需凭据。私有仓库或需要更高 API 限额时，在 Host 环境设置
   `GITHUB_TOKEN`、`GH_TOKEN` 或 `GITHUB_PAT`；Git 安装本身仍需要 Host 配好 Git 凭据。
-- 本地路径、`link:`、没有 SemVer Release 的 GitHub 源、tarball、只读 bundle 和插件管家
-  自身不会自动更新。
+- 本地路径、`link:`、没有 SemVer Release 的 GitHub 源、tarball 和只读 bundle 不会自动更新。
+  插件管家自身只有在通过 GitHub 源安装时才会自我更新。
 - 新版本是否兼容当前 DSH 由 `pluginManager.installBundle` 检查；不兼容时会触发回滚。
 - 需要 DSH 重启才能完成的变更会显示 `restart-required`，不会伪装成已经生效。
 
@@ -78,8 +84,11 @@ Host 端增加两个同源接口：
 
 - `GET /dsh-plugin-steward/updates`：带 10 分钟缓存的 npm / GitHub Release 版本检查；
   返回 `steward.version` 便于排查版本。
-- `POST /dsh-plugin-steward/update`：先探测目标 tarball、写入恢复日志，再移除旧 bundle、
-  按限定次数和超时安装精确的 npm / GitHub Release 目标、校验版本，失败时恢复旧版本。
+- `POST /dsh-plugin-steward/update`：启动更新任务（`?wait=1` 时同步返回结果）。先探测目标
+  tarball、写入恢复日志，再按限定次数和超时安装精确的 npm / GitHub Release 目标、校验版本，
+  失败时恢复旧版本。
+- `GET /dsh-plugin-steward/update/status?id=…`：实时任务状态，包括当前步骤、已用时间、
+  最新 pnpm 输出、日志尾部和最终结果。
 
 更新接口要求：
 

@@ -11,10 +11,24 @@ window.__ModuleLoader__.load({
     const SELF_PACKAGE = '@local/dsh-plugin-steward'
     const UPDATES_PATH = '/dsh-plugin-steward/updates'
     const UPDATE_PATH = '/dsh-plugin-steward/update'
+    const STATUS_PATH = '/dsh-plugin-steward/update/status'
     // The host bounds each registry attempt and reports back; this is only the
     // last-resort stop so the button never spins forever on a dead connection.
     const UPDATE_REQUEST_TIMEOUT_MS = 25 * 60 * 1000
+    const UPDATE_STATUS_DISCONNECT_MS = 15000
     const NS = 'pluginSteward'
+
+    const UPDATE_STEP_KEYS = {
+      check: 'updateStepCheck',
+      preflight: 'updateStepPreflight',
+      journal: 'updateStepJournal',
+      remove: 'updateStepRemove',
+      install: 'updateStepInstall',
+      verify: 'updateStepVerify',
+      finish: 'updateStepFinish',
+      selfInstall: 'updateStepSelfInstall',
+      reload: 'updateStepReload',
+    }
 
     const CSS = `
 .ps-page{width:100%;max-width:1040px;margin:0 auto;display:flex;flex-direction:column;gap:14px;color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.45;box-sizing:border-box}
@@ -103,6 +117,21 @@ window.__ModuleLoader__.load({
 .ps-update{height:24px;padding:0 9px;font-size:11px;border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 55%,var(--dsw-alias-border-l1))}
 .ps-update:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary)}
 .ps-update-progress{display:flex;align-items:center;gap:7px;margin:0 13px 9px;padding:7px 9px;border-radius:7px;font-size:11px;line-height:1.45;color:var(--dsw-alias-brand-primary);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 8%,var(--dsw-alias-bg-layer-2));border:.5px solid color-mix(in srgb,var(--dsw-alias-brand-primary) 25%,var(--dsw-alias-border-l1))}
+.ps-update-job{flex-direction:column;align-items:stretch;gap:6px}
+.ps-job-head{display:flex;align-items:center;gap:7px;min-width:0}
+.ps-job-head strong{font-weight:600;font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ps-job-time{margin-left:auto;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary);white-space:nowrap}
+.ps-job-steps{display:flex;flex-wrap:wrap;gap:4px 9px;margin:1px 0 0;padding:0;list-style:none;font-size:10.5px;color:var(--dsw-alias-label-secondary)}
+.ps-job-steps li{display:inline-flex;align-items:center;gap:4px}
+.ps-job-steps li::before{content:'';width:5px;height:5px;border-radius:50%;flex:none;background:var(--dsw-alias-border-l2)}
+.ps-job-steps li[data-state="done"]::before{background:var(--dsw-alias-state-success-primary)}
+.ps-job-steps li[data-state="active"]::before{background:var(--dsw-alias-brand-primary);box-shadow:0 0 0 2px color-mix(in srgb,var(--dsw-alias-brand-primary) 22%,transparent)}
+.ps-job-steps li[data-state="error"]::before{background:var(--dsw-alias-state-error-primary)}
+.ps-job-steps li[data-state="active"]{color:var(--dsw-alias-label-primary);font-weight:600}
+.ps-job-detail{margin:0;padding:5px 7px;border-radius:6px;background:color-mix(in srgb,var(--dsw-alias-brand-primary) 5%,var(--dsw-alias-bg-layer-1));font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ps-job-log{margin:0;max-height:84px;overflow:auto;padding:6px 7px;border-radius:6px;background:var(--dsw-alias-bg-layer-1);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10px;line-height:1.4;white-space:pre-wrap;word-break:break-all}
+.ps-job-note{margin:0;font-size:10.5px;color:var(--dsw-alias-label-secondary)}
+.ps-self-update{border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 30%,var(--dsw-alias-border-l1));background:color-mix(in srgb,var(--dsw-alias-brand-primary) 6%,var(--dsw-alias-bg-layer-2))}
 .ps-failure{display:flex;flex-direction:column;gap:9px;padding:12px 13px;border-radius:11px;border:.5px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 42%,var(--dsw-alias-border-l1));background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 7%,var(--dsw-alias-bg-layer-1))}
 .ps-failure[data-tone="warn"]{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 42%,var(--dsw-alias-border-l1));background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 7%,var(--dsw-alias-bg-layer-1))}
 .ps-failure-head{display:flex;align-items:flex-start;gap:9px}
@@ -212,6 +241,21 @@ window.__ModuleLoader__.load({
       updateAction: '更新到 v{version}',
       updating: '正在更新…',
       updatingHint: '正在拉取 v{version}；失败会自动回滚，请不要关闭页面。',
+      updateJobStep: '第 {current}/{total} 步 · {label}',
+      updateJobElapsed: '已用 {time}',
+      updateJobLog: 'pnpm 实时输出',
+      updateStepCheck: '检查版本',
+      updateStepPreflight: '预检下载源',
+      updateStepJournal: '写入恢复日志',
+      updateStepRemove: '移除旧版本',
+      updateStepInstall: '安装新版本',
+      updateStepVerify: '校验版本',
+      updateStepFinish: '完成',
+      updateStepSelfInstall: '原地安装新版本',
+      updateStepReload: '重新加载插件',
+      selfUpdateHint: '这是插件管家自己。自我更新会原地安装新版本，不会先删除自己；安装完成后插件会重新加载，页面可能短暂断开。',
+      selfUpdateNote: '自我更新：不会先删除当前插件。',
+      updateInterrupted: '插件重新加载后未能取得更新结果；请刷新页面确认版本。',
       updatedToast: '已把 {name} 更新到 v{version}。',
       updatedRestartToast: '已安装 {name} v{version}，重启后生效。',
       rolledBackToast: '更新 {name} 失败，已回滚到 v{version}。',
@@ -246,6 +290,7 @@ window.__ModuleLoader__.load({
       failureVerifyFailed: '安装后的版本校验失败。',
       failureRollbackFailed: '自动回滚失败。',
       failureNetwork: '无法连接更新服务。',
+      failureInterrupted: '更新结果未返回（插件重新加载）。',
       failureTimeout: '更新超时，已停止等待。',
       failurePendingRecovery: '上一次更新被中断，请先重启 DSH 完成自动恢复。',
       failureJournalFailed: '无法写入更新日志，已取消这次更新。',
@@ -335,6 +380,21 @@ window.__ModuleLoader__.load({
       updateAction: 'Update to v{version}',
       updating: 'Updating…',
       updatingHint: 'Fetching v{version}; failures roll back automatically. Keep this page open.',
+      updateJobStep: 'Step {current}/{total} · {label}',
+      updateJobElapsed: '{time} elapsed',
+      updateJobLog: 'Live pnpm output',
+      updateStepCheck: 'Checking the version',
+      updateStepPreflight: 'Checking download sources',
+      updateStepJournal: 'Writing the recovery journal',
+      updateStepRemove: 'Removing the old version',
+      updateStepInstall: 'Installing the new version',
+      updateStepVerify: 'Verifying the version',
+      updateStepFinish: 'Done',
+      updateStepSelfInstall: 'Installing in place',
+      updateStepReload: 'Reloading the plugin',
+      selfUpdateHint: 'This is Plugin Steward itself. A self-update installs in place without deleting the running plugin; the plugin reloads when it finishes, so the page may disconnect briefly.',
+      selfUpdateNote: 'Self-update: the running plugin is not removed first.',
+      updateInterrupted: 'The plugin reloaded before it reported a result; refresh the page to confirm the version.',
       updatedToast: 'Updated {name} to v{version}.',
       updatedRestartToast: 'Installed {name} v{version}; it takes effect after a restart.',
       rolledBackToast: 'Updating {name} failed and rolled back to v{version}.',
@@ -369,6 +429,7 @@ window.__ModuleLoader__.load({
       failureVerifyFailed: 'The installed version did not match the requested version.',
       failureRollbackFailed: 'Automatic rollback failed.',
       failureNetwork: 'Could not reach the update service.',
+      failureInterrupted: 'The update result did not arrive (the plugin reloaded).',
       failureTimeout: 'The update timed out and waiting stopped.',
       failurePendingRecovery: 'An earlier update was interrupted; restart DSH to let the automatic recovery finish.',
       failureJournalFailed: 'The update journal could not be written, so the update was cancelled.',
@@ -822,6 +883,7 @@ window.__ModuleLoader__.load({
       'rollback-failed': 'failureRollbackFailed',
       'network': 'failureNetwork',
       'timeout': 'failureTimeout',
+      'interrupted': 'failureInterrupted',
       'pending-recovery': 'failurePendingRecovery',
       'journal-failed': 'failureJournalFailed',
       'forbidden': 'failureForbidden',
@@ -985,6 +1047,46 @@ window.__ModuleLoader__.load({
         h('span', { className: 'ps-failure-help' }, t('updateFailureHelp'))))
     }
 
+    function formatDuration(ms) {
+      const total = Math.max(0, Math.floor(Number(ms) / 1000))
+      return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`
+    }
+
+    function updateStepLabel(id, t) {
+      const key = UPDATE_STEP_KEYS[id]
+      return key === undefined ? String(id) : t(key)
+    }
+
+    function UpdateJobPanel({ job, t }) {
+      const steps = Array.isArray(job.steps) ? job.steps : []
+      const current = steps[job.step] || steps.find((step) => step.state === 'active')
+      const label = current === undefined ? t('updating') : updateStepLabel(current.id, t)
+      const detail = typeof job.detail === 'string' ? job.detail : ''
+      const logTail = Array.isArray(job.logTail) ? job.logTail.filter((line) => typeof line === 'string' && line !== '') : []
+      return h('div', { className: 'ps-update-progress ps-update-job', role: 'status' },
+        h('div', { className: 'ps-job-head' },
+          h(Spinner),
+          h('strong', null, t('updateJobStep', {
+            current: Math.min(job.step + 1, steps.length || job.step + 1),
+            total: steps.length || job.step + 1,
+            label,
+          })),
+          h('span', { className: 'ps-job-time' }, t('updateJobElapsed', {
+            time: formatDuration(job.elapsedMs),
+          }))),
+        steps.length === 0
+          ? null
+          : h('ol', { className: 'ps-job-steps' }, steps.map((step) => h('li', {
+            key: step.id,
+            'data-state': step.state,
+          }, updateStepLabel(step.id, t)))),
+        detail === '' ? null : h('div', { className: 'ps-job-detail', title: detail }, detail),
+        logTail.length === 0
+          ? null
+          : h('pre', { className: 'ps-job-log', title: t('updateJobLog') }, logTail.join('\n')),
+        job.self === true ? h('p', { className: 'ps-job-note' }, t('selfUpdateNote')) : null)
+    }
+
     function BundleCard({
       view,
       t,
@@ -992,6 +1094,7 @@ window.__ModuleLoader__.load({
       expanded,
       busyKeys,
       updating,
+      updateJob,
       updatingAny,
       onToggleExpand,
       onToggleBundle,
@@ -1007,13 +1110,18 @@ window.__ModuleLoader__.load({
       const updateUnchecked = updateInfo !== undefined && updateInfo.status === 'unknown'
       const isSelf = bundle.name === SELF_PACKAGE
       const isBusy = busyKeys[`bundle:${bundle.name}`] === true
-      const isReadOnly = bundle.readOnlyReason !== undefined || isSelf
+      const systemReadOnly = bundle.readOnlyReason !== undefined
+      const isReadOnly = systemReadOnly || isSelf
       const isUpdating = updating === true
+      const selfUpdatable = isSelf && isUpdate && updateInfo.provider === 'github'
       const canUpdate = isUpdate
-        && !isSelf
-        && !isReadOnly
+        && !systemReadOnly
         && bundle.removable !== false
         && typeof onUpdate === 'function'
+        && (!isSelf || selfUpdatable)
+      const job = updateJob !== null && typeof updateJob === 'object' && updateJob.job
+        ? updateJob.job
+        : null
       const switchTitle = isSelf
         ? t('selfProtected')
         : isReadOnly
@@ -1079,10 +1187,16 @@ window.__ModuleLoader__.load({
         h('span', null, t('bundleError', { reason: errorReason }))),
       metaReason === null ? null : h('div', { className: 'ps-inline-warning' },
         h('span', null, t('metaError', { reason: metaReason }))),
+      isSelf && isUpdate && updateInfo.provider === 'github'
+        ? h('div', { className: 'ps-inline-warning ps-self-update' },
+          h('span', null, t('selfUpdateHint')))
+        : null,
       isUpdating
-        ? h('div', { className: 'ps-update-progress', role: 'status' },
-          h(Spinner),
-          h('span', null, t('updatingHint', { version: updatedVersion || '—' })))
+        ? (job === null
+          ? h('div', { className: 'ps-update-progress', role: 'status' },
+            h(Spinner),
+            h('span', null, t('updatingHint', { version: updatedVersion || '—' })))
+          : h(UpdateJobPanel, { job, t }))
         : null,
       h('div', { className: 'ps-card-foot' },
         rows.length > 0
@@ -1305,15 +1419,114 @@ window.__ModuleLoader__.load({
         }
       }
 
+      function updateTimeoutResult(view, target) {
+        const reason = translate('updateTimeoutDetail')
+        return {
+          status: 'failed',
+          name: view.bundle.name,
+          fromVersion: view.bundle.version,
+          toVersion: target,
+          reason,
+          failure: { code: 'timeout', detail: reason },
+        }
+      }
+
+      async function pollUpdateJob(view, target, jobId, controller) {
+        const deadline = Date.now() + UPDATE_REQUEST_TIMEOUT_MS - 5000
+        let disconnectedSince = 0
+        while (Date.now() < deadline) {
+          if (controller.signal.aborted) return updateTimeoutResult(view, target)
+          await new Promise((resolve) => setTimeout(resolve, 500))
+          let job = null
+          try {
+            const response = await fetch(`${STATUS_PATH}?id=${encodeURIComponent(jobId)}`, {
+              cache: 'no-store',
+              credentials: 'same-origin',
+              signal: controller.signal,
+            })
+            let payload = null
+            try {
+              payload = await response.json()
+            } catch {
+              // The retry below decides whether the connection is only reloading.
+            }
+            if (response.status === 200 && payload !== null && typeof payload === 'object'
+              && payload.job !== null && typeof payload.job === 'object') {
+              job = payload.job
+            }
+          } catch (error) {
+            if (error !== null && typeof error === 'object' && error.name === 'AbortError') {
+              return updateTimeoutResult(view, target)
+            }
+            // A self-update reload can briefly drop this connection.
+          }
+
+          if (job !== null) {
+            disconnectedSince = 0
+            setUpdating({ name: view.bundle.name, version: target, job })
+            if (job.done === true) {
+              return job.result !== null && typeof job.result === 'object' ? job.result : null
+            }
+            continue
+          }
+
+          if (disconnectedSince === 0) disconnectedSince = Date.now()
+          if (Date.now() - disconnectedSince < UPDATE_STATUS_DISCONNECT_MS) continue
+
+          // The plugin may have reloaded into the new version and restored the
+          // job from disk. If the status route is still gone, infer from the
+          // profile itself instead of reporting a deletion that did not happen.
+          try {
+            const inventory = await loadInventory()
+            const current = inventory.bundles.find((bundle) => bundle.name === view.bundle.name)
+            if (current !== undefined && current.version === target) {
+              return {
+                status: 'updated',
+                name: view.bundle.name,
+                fromVersion: view.bundle.version,
+                toVersion: target,
+                inferred: true,
+              }
+            }
+            if (current !== undefined && current.version === view.bundle.version) {
+              const reason = translate('updateInterrupted')
+              return {
+                status: 'failed',
+                name: view.bundle.name,
+                fromVersion: view.bundle.version,
+                toVersion: target,
+                keptVersion: view.bundle.version,
+                reason,
+                failure: { code: 'interrupted', detail: reason },
+              }
+            }
+          } catch {
+            // Keep polling until the deadline.
+          }
+          const reason = translate('updateInterrupted')
+          return {
+            status: 'failed',
+            name: view.bundle.name,
+            fromVersion: view.bundle.version,
+            toVersion: target,
+            reason,
+            failure: { code: 'interrupted', detail: reason },
+          }
+        }
+        return updateTimeoutResult(view, target)
+      }
+
       async function runUpdate(view) {
         if (updateInFlight.current || updating !== null) return
         const target = view.updateInfo && typeof view.updateInfo.latest === 'string'
           ? view.updateInfo.latest
           : ''
-        if (target === '' || view.bundle.name === SELF_PACKAGE) return
+        const isSelf = view.bundle.name === SELF_PACKAGE
+        if (target === '') return
+        if (isSelf && !(view.updateInfo && view.updateInfo.provider === 'github')) return
 
         updateInFlight.current = true
-        setUpdating({ name: view.bundle.name, version: target })
+        setUpdating({ name: view.bundle.name, version: target, job: null })
         setUpdateFailure(null)
         setNotice(null)
         const controller = new AbortController()
@@ -1328,7 +1541,7 @@ window.__ModuleLoader__.load({
               'content-type': 'application/json',
               'x-plugin-steward-update': '1',
             },
-            body: JSON.stringify({ name: view.bundle.name, version: target }),
+            body: JSON.stringify({ name: view.bundle.name, version: target, job: true }),
           })
           let payload = null
           try {
@@ -1351,20 +1564,28 @@ window.__ModuleLoader__.load({
             return
           }
 
-          const result = payload.result
-          if (!result || typeof result !== 'object') {
-            const failure = failureFromHttp(null, view, target, new Error(translate('unknownError')), 'update-failed')
-            setUpdateFailure(failure)
-            setNotice({
-              tone: 'error',
-              text: translate('updateFailedToast', {
-                name: view.title,
-                reason: failure.reason,
-              }),
-            })
-            void refresh()
-            void ensureUpdates(true)
-            return
+          let result = null
+          if (payload.result !== null && typeof payload.result === 'object') {
+            // Synchronous fallback, used by the Host's wait mode.
+            result = payload.result
+          } else {
+            const jobId = typeof payload.jobId === 'string' ? payload.jobId : ''
+            if (jobId === '') {
+              const failure = failureFromHttp(null, view, target, new Error(translate('unknownError')), 'update-failed')
+              setUpdateFailure(failure)
+              setNotice({
+                tone: 'error',
+                text: translate('updateFailedToast', { name: view.title, reason: failure.reason }),
+              })
+              void refresh()
+              void ensureUpdates(true)
+              return
+            }
+            if (payload.job !== null && typeof payload.job === 'object') {
+              setUpdating({ name: view.bundle.name, version: target, job: payload.job })
+            }
+            result = await pollUpdateJob(view, target, jobId, controller)
+            if (result === null) result = updateTimeoutResult(view, target)
           }
 
           if (result.status === 'rolled-back' || result.status === 'rollback-failed' || result.status === 'failed') {
@@ -1645,6 +1866,7 @@ window.__ModuleLoader__.load({
                   || (queryText !== '' && view.rows.some((row) => row.searchText.includes(queryText))),
                 busyKeys,
                 updating: updating !== null && updating.name === view.bundle.name,
+                updateJob: updating !== null && updating.name === view.bundle.name ? updating : null,
                 updatingAny: updating !== null,
                 onToggleExpand: toggleExpanded,
                 onToggleBundle: toggleBundle,
