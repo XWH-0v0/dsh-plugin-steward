@@ -27,16 +27,23 @@
 更新流程：
 
 1. 从更新缓存确认点击的版本仍是该插件的 `latest`；
-2. 移除旧版本 bundle；
-3. 安装精确的新版本，并保留原来的启用状态；
-4. 校验实际安装版本；
-5. 任一步失败时：
-   - 先尝试删除失败的新版本；
-   - 再重新安装旧版本；
-   - 返回 `rolled-back` 或 `rollback-failed`。
+2. 对 registry 包，先对候选 registry 探测目标 tarball；如果所有 registry 都不可用，
+   返回 `network`，旧版本保持安装、不做任何改动；
+3. 写入恢复日志（`.plugin-manager/steward-pending-update.json`）；
+4. 移除旧版本 bundle；
+5. 安装精确的新版本，并保留原来的启用状态；每个 registry 的安装都有超时上限，
+   卡住的安装会通过插件管理器取消，而不是等它自己的十分钟静默超时；
+6. 校验实际安装版本，成功后删除恢复日志；
+7. 任一步失败时：
+   - 旧版本仍在磁盘上：返回 `failed` 和 `keptVersion`；
+   - 否则重新安装旧版本，返回 `rolled-back`；
+   - 回滚也失败：保留恢复日志，返回 `rollback-failed`。
 
-更新结果可能为 `updated`、`restart-required`、`rolled-back` 或 `rollback-failed`。
-如果回滚失败，界面会显示旧版本号，此时需要到官方插件页手动重装。
+更新结果可能为 `updated`、`restart-required`、`failed`、`rolled-back` 或
+`rollback-failed`。如果回滚失败，界面会显示旧版本号，此时需要到官方插件页手动重装。
+
+如果进程在「移除完成、安装完成」之间退出，下一次启动会读取恢复日志，自动重装旧版本，
+然后再允许新的更新。恢复日志最多保留七天，profile 回到已知良好状态后删除。
 
 当 DSH 对移除操作返回 `restart-required` 时，这属于延迟成功，不是失败：新版本仍会
 安装，结果标记为 `restart-required`；当前进程继续运行旧代码，重启 DSH 后才生效。
@@ -46,7 +53,8 @@
 状态和可选的阶段诊断。原因可以一键复制，方便反馈问题。失败结果会包含顶层 `reason`、
 原始 `failure` 对象，以及回滚失败时的 `rollbackReason`。
 
-> 更新沿用官方插件管理的「移除 + 安装」流程。因此更新成功后，该 bundle 会重新排到
+> 更新沿用官方插件管理的「移除 + 安装」流程，因为带 HMR 的运行中 profile 会拒绝在
+> 已有依赖上直接安装（`already-installed`）。因此更新成功后，该 bundle 会重新排到
 > profile bundle 列表末尾，可能影响配置覆盖顺序。
 
 ## 更新来源
@@ -68,9 +76,10 @@
 浏览器端通过生成的 `pluginManager` Remote 命名空间读取插件清单并开关插件。
 Host 端增加两个同源接口：
 
-- `GET /dsh-plugin-steward/updates`：带 10 分钟缓存的 npm / GitHub Release 版本检查。
-- `POST /dsh-plugin-steward/update`：移除旧 bundle、安装精确的 npm 或 GitHub Release 目标、
-  校验版本，并在失败时回滚。
+- `GET /dsh-plugin-steward/updates`：带 10 分钟缓存的 npm / GitHub Release 版本检查；
+  返回 `steward.version` 便于排查版本。
+- `POST /dsh-plugin-steward/update`：先探测目标 tarball、写入恢复日志，再移除旧 bundle、
+  按限定次数和超时安装精确的 npm / GitHub Release 目标、校验版本，失败时恢复旧版本。
 
 更新接口要求：
 

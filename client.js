@@ -11,6 +11,9 @@ window.__ModuleLoader__.load({
     const SELF_PACKAGE = '@local/dsh-plugin-steward'
     const UPDATES_PATH = '/dsh-plugin-steward/updates'
     const UPDATE_PATH = '/dsh-plugin-steward/update'
+    // The host bounds each registry attempt and reports back; this is only the
+    // last-resort stop so the button never spins forever on a dead connection.
+    const UPDATE_REQUEST_TIMEOUT_MS = 25 * 60 * 1000
     const NS = 'pluginSteward'
 
     const CSS = `
@@ -215,11 +218,14 @@ window.__ModuleLoader__.load({
       rolledBackRestartToast: '更新 {name} 失败，已安装回 v{version}；重启后完成回滚。',
       rollbackFailedToast: '更新 {name} 失败，自动回滚也未完成：{reason}。请到官方插件页手动重装 v{version}。',
       updateFailedToast: '更新 {name} 失败：{reason}',
+      updateFailedKeptToast: '更新 {name} 失败，已保留 v{version}：{reason}',
+      updateTimeoutDetail: '等待更新结果超过 25 分钟，已停止等待。若旧版本已被移除，重启 DSH 会自动尝试恢复。',
       updateFailureTitle: '更新失败',
       updateFailureTarget: '{name}：v{from} → v{to}',
       updateFailureReason: '失败原因',
       updateFailureCode: '错误代码',
       updateFailureRolledBack: '已自动回滚到 v{version}。',
+      updateFailureKept: '旧版本 v{version} 仍在，没有被删除。',
       updateFailureRollbackFailed: '自动回滚未完成，请到官方插件页手动重装 v{version}。',
       updateFailureRollbackReason: '回滚失败原因',
       updateFailureStages: '查看诊断信息',
@@ -240,6 +246,9 @@ window.__ModuleLoader__.load({
       failureVerifyFailed: '安装后的版本校验失败。',
       failureRollbackFailed: '自动回滚失败。',
       failureNetwork: '无法连接更新服务。',
+      failureTimeout: '更新超时，已停止等待。',
+      failurePendingRecovery: '上一次更新被中断，请先重启 DSH 完成自动恢复。',
+      failureJournalFailed: '无法写入更新日志，已取消这次更新。',
       failureForbidden: '更新请求被拒绝。',
       failureInvalidRequest: '更新请求格式无效。',
       failureUnknownCode: '更新失败。',
@@ -332,11 +341,14 @@ window.__ModuleLoader__.load({
       rolledBackRestartToast: 'Updating {name} failed; v{version} is installed and the rollback completes after a restart.',
       rollbackFailedToast: 'Updating {name} failed and automatic rollback did not finish: {reason}. Reinstall v{version} from the official Plugins page.',
       updateFailedToast: 'Updating {name} failed: {reason}',
+      updateFailedKeptToast: 'Could not update {name}; v{version} is still installed: {reason}',
+      updateTimeoutDetail: 'The update did not report back within 25 minutes, so waiting stopped. If the old version was removed, restarting DSH retries the recovery automatically.',
       updateFailureTitle: 'Update failed',
       updateFailureTarget: '{name}: v{from} → v{to}',
       updateFailureReason: 'Reason',
       updateFailureCode: 'Error code',
       updateFailureRolledBack: 'Rolled back to v{version} automatically.',
+      updateFailureKept: 'The previous version v{version} is still installed and was not deleted.',
       updateFailureRollbackFailed: 'Automatic rollback did not finish. Reinstall v{version} from the official Plugins page.',
       updateFailureRollbackReason: 'Rollback failure',
       updateFailureStages: 'Show diagnostics',
@@ -357,6 +369,9 @@ window.__ModuleLoader__.load({
       failureVerifyFailed: 'The installed version did not match the requested version.',
       failureRollbackFailed: 'Automatic rollback failed.',
       failureNetwork: 'Could not reach the update service.',
+      failureTimeout: 'The update timed out and waiting stopped.',
+      failurePendingRecovery: 'An earlier update was interrupted; restart DSH to let the automatic recovery finish.',
+      failureJournalFailed: 'The update journal could not be written, so the update was cancelled.',
       failureForbidden: 'The update request was refused.',
       failureInvalidRequest: 'The update request was malformed.',
       failureUnknownCode: 'The update failed.',
@@ -760,6 +775,16 @@ window.__ModuleLoader__.load({
           }),
         }
       }
+      if (result.status === 'failed' && typeof result.keptVersion === 'string' && result.keptVersion !== '') {
+        return {
+          tone: 'error',
+          text: t('updateFailedKeptToast', {
+            name,
+            version: result.keptVersion,
+            reason: result.reason || result.failure?.detail || t('unknownError'),
+          }),
+        }
+      }
       return {
         tone: 'error',
         text: t('updateFailedToast', {
@@ -796,6 +821,9 @@ window.__ModuleLoader__.load({
       'verify-failed': 'failureVerifyFailed',
       'rollback-failed': 'failureRollbackFailed',
       'network': 'failureNetwork',
+      'timeout': 'failureTimeout',
+      'pending-recovery': 'failurePendingRecovery',
+      'journal-failed': 'failureJournalFailed',
       'forbidden': 'failureForbidden',
       'missing-update-intent': 'failureForbidden',
       'invalid-body': 'failureInvalidRequest',
@@ -847,6 +875,7 @@ window.__ModuleLoader__.load({
         rollbackReason: result && typeof result.rollbackReason === 'string'
           ? result.rollbackReason
           : (result && typeof result.rollbackError === 'string' ? result.rollbackError : ''),
+        keptVersion: result && typeof result.keptVersion === 'string' ? result.keptVersion : '',
         stages: result && Array.isArray(result.stages) ? result.stages : [],
       }
     }
@@ -902,7 +931,10 @@ window.__ModuleLoader__.load({
 
       const rollbackFailed = failure.status === 'rollback-failed'
       const rolledBack = failure.status === 'rolled-back'
-      const tone = rollbackFailed ? 'error' : rolledBack ? 'warn' : 'error'
+      const kept = failure.status === 'failed'
+        && typeof failure.keptVersion === 'string'
+        && failure.keptVersion !== ''
+      const tone = rollbackFailed ? 'error' : (rolledBack || kept) ? 'warn' : 'error'
 
       return h('section', {
         className: 'ps-failure',
@@ -929,6 +961,10 @@ window.__ModuleLoader__.load({
       rolledBack
         ? h('p', { className: 'ps-failure-rollback' },
           t('updateFailureRolledBack', { version: failure.fromVersion || '?' }))
+        : null,
+      kept
+        ? h('p', { className: 'ps-failure-rollback' },
+          t('updateFailureKept', { version: failure.keptVersion }))
         : null,
       rollbackFailed
         ? h('div', { className: 'ps-failure-rollback', 'data-tone': 'error' },
@@ -1280,11 +1316,14 @@ window.__ModuleLoader__.load({
         setUpdating({ name: view.bundle.name, version: target })
         setUpdateFailure(null)
         setNotice(null)
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), UPDATE_REQUEST_TIMEOUT_MS)
         try {
           const response = await fetch(UPDATE_PATH, {
             method: 'POST',
             cache: 'no-store',
             credentials: 'same-origin',
+            signal: controller.signal,
             headers: {
               'content-type': 'application/json',
               'x-plugin-steward-update': '1',
@@ -1337,7 +1376,16 @@ window.__ModuleLoader__.load({
           await refresh()
           await ensureUpdates(true)
         } catch (error) {
-          const failure = failureFromHttp(null, view, target, error)
+          const aborted = error !== null && typeof error === 'object' && error.name === 'AbortError'
+          const failure = aborted
+            ? failureFromHttp(
+              { error: 'timeout', reason: translate('updateTimeoutDetail') },
+              view,
+              target,
+              null,
+              'timeout',
+            )
+            : failureFromHttp(null, view, target, error)
           setUpdateFailure(failure)
           setNotice({
             tone: 'error',
@@ -1346,6 +1394,7 @@ window.__ModuleLoader__.load({
           void refresh()
           void ensureUpdates(true)
         } finally {
+          clearTimeout(timer)
           updateInFlight.current = false
           setUpdating(null)
         }

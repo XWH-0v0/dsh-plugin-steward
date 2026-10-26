@@ -9,6 +9,9 @@
  * update route additionally requires a JSON body and a private request header.
  */
 
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+
 const ROUTE_PATH = '/dsh-plugin-steward/updates'
 const UPDATE_ROUTE_PATH = '/dsh-plugin-steward/update'
 const GITHUB_API = 'https://api.github.com'
@@ -16,10 +19,21 @@ const CACHE_TTL_MS = 10 * 60 * 1000
 const FETCH_TIMEOUT_MS = 7000
 const UPDATE_BODY_BYTES = 8192
 const SELF_PACKAGE = '@local/dsh-plugin-steward'
+const STEWARD_VERSION = '1.2.1'
 const PUBLIC_REGISTRIES = new Set([
-  'https://registry.npmjs.org',
-  'https://registry.npmmirror.com',
+  'https://registry.npmjs.org/',
+  'https://registry.npmmirror.com/',
 ])
+/** Bound one registry installation attempt; a stalled registry is cancelled, not waited out. */
+const UPDATE_ATTEMPT_TIMEOUT_MS = 4 * 60 * 1000
+/** Bound the tarball reachability check made before the old version is removed. */
+const UPDATE_PREFLIGHT_TIMEOUT_MS = 12 * 1000
+/** Bound how long cancellation may take before the next attempt starts anyway. */
+const UPDATE_CANCEL_WAIT_MS = 30 * 1000
+/** Let the profile finish starting before an interrupted update is recovered. */
+const UPDATE_RECOVERY_DELAY_MS = 10 * 1000
+const JOURNAL_VERSION = 1
+const JOURNAL_FILE = 'steward-pending-update.json'
 const EXTERNAL_SOURCE = /^(?:file|link|workspace|portal|git\+|git:|github:|gitlab:|bitbucket:|https?:|npm:)/i
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
 
@@ -162,6 +176,8 @@ export function apply(ctx) {
       const expected = error?.code === 'invalid-target' || error?.code === 'not-updatable'
         || error?.code === 'version-changed' || error?.code === 'not-installed'
         || error?.code === 'read-only' || error?.code === 'external-source'
+        || error?.code === 'network' || error?.code === 'timeout'
+        || error?.code === 'pending-recovery' || error?.code === 'journal-failed'
       if (!expected) {
         try {
           ctx.logger?.error?.(error)
@@ -199,6 +215,71 @@ export function apply(ctx) {
       'dsh-plugin-steward: update action route',
     )
   })
+
+  // An update that is interrupted between removeBundle and installBundle would
+  // otherwise leave the plugin deleted. The journal is written before removal
+  // and cleared only once the profile is back in a known-good state, so a
+  // restart can finish the rollback the killed process started.
+  const recoverInterruptedUpdate = async () => {
+    if (updating) return
+    // Claim the busy flag before the first await so a concurrent timer or a
+    // user update cannot start a second profile operation.
+    updating = true
+    try {
+      const record = await readJournal(ctx)
+      if (record === null) return
+
+      let current
+      try {
+        current = await findInstalledBundle(ctx, record.name)
+      } catch {
+        return
+      }
+      if (current?.installed === true) {
+        // The target, the old version, or a deliberate third version is on disk.
+        // There is nothing to recover and nothing that should be overwritten.
+        await clearJournal(ctx)
+        return
+      }
+      if (typeof record.fromVersion !== 'string' || record.fromVersion === '') return
+
+      const startedAt = Date.parse(record.startedAt || '')
+      if (Number.isFinite(startedAt) && Date.now() - startedAt > 7 * 24 * 60 * 60 * 1000) return
+
+      const stages = []
+      const rollback = await restoreOldVersion(
+        ctx,
+        record.name,
+        record.fromVersion,
+        Array.isArray(record.rollbackSpecs) ? record.rollbackSpecs : [],
+        record.installArgs && typeof record.installArgs === 'object' ? record.installArgs : {},
+        Array.isArray(record.registries) ? record.registries : [],
+        stages,
+      )
+      if (rollback.restored) {
+        await clearJournal(ctx)
+        try {
+          ctx.logger?.info?.(`dsh-plugin-steward: restored ${record.name}@${record.fromVersion} after an interrupted update`)
+        } catch {
+          // Logging must not disturb recovery.
+        }
+      } else {
+        record.stage = 'rollback-failed'
+        record.rollbackError = truncate(rollback.error || 'The old version could not be reinstalled.', 600)
+        record.recoveredAt = new Date().toISOString()
+        await writeJournal(ctx, record)
+      }
+    } finally {
+      updating = false
+    }
+  }
+
+  ctx.effect(() => {
+    const delay = envDuration('DSH_PLUGIN_STEWARD_RECOVERY_DELAY_MS', UPDATE_RECOVERY_DELAY_MS)
+    const timer = setTimeout(() => { void recoverInterruptedUpdate() }, delay)
+    if (typeof timer.unref === 'function') timer.unref()
+    return () => clearTimeout(timer)
+  }, 'dsh-plugin-steward: recover an interrupted update')
 }
 
 /**
@@ -224,8 +305,7 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     throw updateProblem('invalid-target', 'The requested version is not newer.')
   }
 
-  const bundles = await ctx.pluginManager.listBundles()
-  const bundle = Array.isArray(bundles) ? bundles.find((candidate) => candidate?.name === name) : undefined
+  const bundle = await findInstalledBundle(ctx, name)
   if (!bundle || bundle.installed !== true || bundle.availability !== 'profile') {
     throw updateProblem('not-installed', 'The bundle is not installed from the profile.')
   }
@@ -237,6 +317,18 @@ async function performUpdate(ctx, load, name, requestedVersion) {
   }
   if (bundle.version !== fromVersion) {
     throw updateProblem('version-changed', 'The installed version changed; check for updates again.')
+  }
+
+  // A previous update may have been interrupted between removal and
+  // installation. Do not overwrite its journal with a new attempt.
+  const pending = await readJournal(ctx)
+  if (pending !== null) {
+    if (pending.name === name
+      && (bundle.version === pending.toVersion || bundle.version === pending.fromVersion)) {
+      await clearJournal(ctx)
+    } else {
+      throw updateProblem('pending-recovery', 'An earlier update was interrupted; recover it before starting another update.')
+    }
   }
 
   const source = typeof bundle.source === 'string' ? bundle.source.trim() : ''
@@ -271,14 +363,45 @@ async function performUpdate(ctx, load, name, requestedVersion) {
   const registry = isGitHub
     ? undefined
     : (typeof info.registry === 'string' && /^https?:\/\//i.test(info.registry) ? info.registry : undefined)
-  const installArgs = isGitHub ? { enabled, saveExact: true } : installOptions(enabled, registry)
+  const baseInstallArgs = isGitHub ? { enabled, saveExact: true } : installOptions(enabled, registry)
+
+  // Ask each candidate registry for the exact tarball before touching the
+  // profile. A registry that cannot serve the tarball is skipped, and when no
+  // candidate answers the update fails with the old version still installed.
+  // This is what turns "remove old, then download for ten minutes" into a
+  // harmless refusal.
+  const registries = isGitHub
+    ? []
+    : await planInstallRegistries(ctx, name, requestedVersion, info)
+  if (!isGitHub && registries.length === 0) {
+    throw updateProblem('network', 'No registry answered the update check; the installed version was left unchanged.')
+  }
+
+  const journal = {
+    version: JOURNAL_VERSION,
+    name,
+    fromVersion,
+    toVersion: requestedVersion,
+    provider: isGitHub ? 'github' : 'registry',
+    installSpec,
+    rollbackSpecs,
+    installArgs: baseInstallArgs,
+    registries,
+    startedAt: new Date().toISOString(),
+    stage: 'removing',
+  }
+  if (!await writeJournal(ctx, journal)) {
+    throw updateProblem('journal-failed', 'The update journal could not be written; nothing was changed.')
+  }
+
   const stages = []
   let failure = null
   let deferredRemoval = false
-  let installAttempted = false
+  let removedChange = null
 
   try {
     const removed = await ctx.pluginManager.removeBundle(name)
+    removedChange = removed
     stages.push(stageOf('remove', removed))
     if (!removalAccepted(removed)) {
       throw updateProblem('remove-failed', changeReason(removed))
@@ -287,23 +410,25 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     // memory until the next start. That is a deferred success, not a failure:
     // continue installing the new version so the restart picks it up.
     deferredRemoval = removed.application === 'restart-required'
+    journal.stage = 'removed'
+    await writeJournal(ctx, journal)
 
-    installAttempted = true
-    const installed = await ctx.pluginManager.installBundle(
-      installSpec,
-      installArgs,
-    )
-    stages.push(stageOf('install', installed))
-    if (!installSucceeded(installed)) {
-      throw updateProblem('install-failed', changeReason(installed))
+    journal.stage = 'installing'
+    await writeJournal(ctx, journal)
+    const attempt = await installVersion(ctx, installSpec, baseInstallArgs, registries, stages, 'install')
+    const installed = attempt.change
+    if (installed === null || !installSucceeded(installed)) {
+      throw attempt.error || updateProblem('install-failed', 'The new version could not be installed.')
     }
 
-    const after = await ctx.pluginManager.listBundles()
-    const current = Array.isArray(after) ? after.find((candidate) => candidate?.name === name) : undefined
+    journal.stage = 'verifying'
+    await writeJournal(ctx, journal)
+    const current = await findInstalledBundle(ctx, name)
     if (current?.version !== requestedVersion && installed.version !== requestedVersion) {
       throw updateProblem('verify-failed', 'The installed version did not become the requested version.')
     }
 
+    await clearJournal(ctx)
     const restartRequired = deferredRemoval || installed.application === 'restart-required'
     return {
       status: restartRequired ? 'restart-required' : 'updated',
@@ -317,8 +442,7 @@ async function performUpdate(ctx, load, name, requestedVersion) {
       enabled,
       registry: registry || null,
       restartRequired,
-      restartReason: installed.restartReason || removed.restartReason,
-      deferredRemoval,
+      restartReason: installed.restartReason || removedChange?.restartReason,
       overridden: installed.application === 'overridden',
       stages,
     }
@@ -326,49 +450,69 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     failure = error
   }
 
-  // Only a failed install can have left a new version behind. If removal
-  // itself failed or was deferred, the package on disk is still the old one;
-  // skip cleanup and let rollback restore its selection.
-  if (installAttempted) {
-    try {
-      const cleanup = await ctx.pluginManager.removeBundle(name)
-      stages.push(stageOf('cleanup', cleanup))
-    } catch (error) {
-      stages.push({ stage: 'cleanup', error: truncate(messageOf(error), 600) })
-    }
-  }
-
-  let rollback = null
-  let rollbackError = null
-  for (let index = 0; index < rollbackSpecs.length; index += 1) {
-    const stage = index === 0 ? 'rollback' : `rollback-${index + 1}`
-    try {
-      const attempt = await ctx.pluginManager.installBundle(rollbackSpecs[index], installArgs)
-      stages.push(stageOf(stage, attempt))
-      if (installSucceeded(attempt)) {
-        rollback = attempt
-        rollbackError = null
-        break
-      }
-      rollbackError = changeReason(attempt)
-    } catch (error) {
-      rollbackError = messageOf(error)
-      stages.push({ stage, error: truncate(rollbackError, 600) })
-    }
-  }
-
-  // A retry can report "already installed" after a partial cleanup; the
-  // profile's actual version is the final authority on whether rollback worked.
-  let restored = false
+  // The failure may have happened before the removal committed. In that case
+  // the old version is still on disk and only reporting is left to do.
+  let current = null
   try {
-    const after = await ctx.pluginManager.listBundles()
-    const current = Array.isArray(after) ? after.find((candidate) => candidate?.name === name) : undefined
-    restored = current?.installed === true && current?.version === fromVersion
+    current = await findInstalledBundle(ctx, name)
   } catch {
-    // The rollback stage already carries the useful diagnostic.
+    // The stage diagnostics below carry the useful detail.
+  }
+  if (current?.installed === true && current.version === fromVersion) {
+    await clearJournal(ctx)
+    return {
+      status: 'failed',
+      provider: isGitHub ? 'github' : 'registry',
+      repo: githubRepo,
+      releaseTag: isGitHub && typeof info.releaseTag === 'string' ? info.releaseTag : null,
+      releaseUrl: isGitHub && typeof info.releaseUrl === 'string' ? info.releaseUrl : null,
+      name,
+      fromVersion,
+      toVersion: requestedVersion,
+      enabled,
+      registry: registry || null,
+      keptVersion: fromVersion,
+      reason: failure?.message || 'The update failed.',
+      failure: problemOf(failure),
+      stages,
+    }
+  }
+  if (current?.installed === true && current.version === requestedVersion) {
+    await clearJournal(ctx)
+    return {
+      status: 'restart-required',
+      provider: isGitHub ? 'github' : 'registry',
+      repo: githubRepo,
+      releaseTag: isGitHub && typeof info.releaseTag === 'string' ? info.releaseTag : null,
+      releaseUrl: isGitHub && typeof info.releaseUrl === 'string' ? info.releaseUrl : null,
+      name,
+      fromVersion,
+      toVersion: requestedVersion,
+      enabled,
+      registry: registry || null,
+      restartRequired: true,
+      stages,
+    }
   }
 
-  if (restored || (!isGitHub && rollback !== null && installSucceeded(rollback))) {
+  // The old version is gone. Reinstall it through the same preflighted
+  // registries, and keep the journal until the profile is known-good again.
+  journal.stage = 'rolling-back'
+  journal.error = truncate(messageOf(failure), 600)
+  await writeJournal(ctx, journal)
+
+  const rollback = await restoreOldVersion(
+    ctx,
+    name,
+    fromVersion,
+    rollbackSpecs,
+    baseInstallArgs,
+    registries,
+    stages,
+  )
+
+  if (rollback.restored) {
+    await clearJournal(ctx)
     return {
       status: 'rolled-back',
       provider: isGitHub ? 'github' : 'registry',
@@ -380,12 +524,16 @@ async function performUpdate(ctx, load, name, requestedVersion) {
       toVersion: requestedVersion,
       enabled,
       registry: registry || null,
-      rollbackRestartRequired: rollback?.application === 'restart-required',
+      rollbackRestartRequired: rollback.change?.application === 'restart-required',
       reason: failure?.message || 'The update failed.',
       failure: problemOf(failure),
       stages,
     }
   }
+
+  journal.stage = 'rollback-failed'
+  journal.rollbackError = truncate(rollback.error || 'The old version could not be reinstalled.', 600)
+  await writeJournal(ctx, journal)
 
   return {
     status: 'rollback-failed',
@@ -400,9 +548,351 @@ async function performUpdate(ctx, load, name, requestedVersion) {
     registry: registry || null,
     reason: failure?.message || 'The update failed.',
     failure: problemOf(failure),
-    rollbackError: truncate(rollbackError || 'The old version could not be reinstalled.', 600),
-    rollbackReason: truncate(rollbackError || 'The old version could not be reinstalled.', 600),
+    rollbackError: journal.rollbackError,
+    rollbackReason: journal.rollbackError,
     stages,
+  }
+}
+
+async function findInstalledBundle(ctx, name) {
+  const bundles = await ctx.pluginManager.listBundles()
+  return Array.isArray(bundles) ? bundles.find((candidate) => candidate?.name === name) : undefined
+}
+
+/** Try one install spec against each preflighted registry, stopping at the first success. */
+async function installVersion(ctx, spec, baseInstallArgs, registries, stages, prefix) {
+  const candidates = registries.length > 0 ? registries : [null]
+  let lastError = null
+  let lastChange = null
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const registry = candidates[index]
+    const stageName = index === 0 ? prefix : `${prefix}-${index + 1}`
+    const args = { ...baseInstallArgs }
+    if (typeof registry === 'string' && registry !== '') args.registry = registry
+
+    try {
+      const change = await installWithDeadline(
+        ctx,
+        spec,
+        args,
+        newRequestId(),
+        envDuration('DSH_PLUGIN_STEWARD_ATTEMPT_TIMEOUT_MS', UPDATE_ATTEMPT_TIMEOUT_MS),
+      )
+      const stage = stageOf(stageName, change)
+      stage.registry = typeof registry === 'string' ? registry : 'default'
+      stages.push(stage)
+      lastChange = change
+      if (installSucceeded(change)) return { change, error: null }
+
+      lastError = updateProblem('install-failed', changeReason(change))
+      const code = change?.error?.code
+      // These answers cannot change by asking another registry.
+      if (code === 'already-installed' || code === 'incompatible-version'
+        || code === 'not-bundle' || code === 'ambiguous-install') {
+        return { change, error: lastError }
+      }
+    } catch (error) {
+      lastError = error
+      stages.push({
+        stage: stageName,
+        registry: typeof registry === 'string' ? registry : 'default',
+        error: truncate(messageOf(error), 600),
+      })
+      // A run that could not be stopped is still using the profile; a second
+      // attempt would race it, so report the timeout instead.
+      if (error?.code === 'timeout' && error?.cancelled !== true) break
+    }
+  }
+
+  return { change: lastChange, error: lastError || updateProblem('install-failed', 'The installation failed.') }
+}
+
+/**
+ * Call installBundle with a hard deadline. On expiry the manager's own
+ * cancellation is used, so pnpm is stopped and the profile manifest and
+ * lockfile are restored before the next attempt starts.
+ */
+async function installWithDeadline(ctx, spec, options, requestId, timeoutMs) {
+  const manager = ctx.pluginManager
+  const pending = manager.installBundle(spec, { ...options, requestId })
+  let settled = false
+  pending.then(
+    () => { settled = true },
+    () => { settled = true },
+  )
+
+  let timer = null
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve('deadline'), timeoutMs)
+  })
+  let outcome
+  try {
+    outcome = await Promise.race([
+      pending.then((value) => ({ value }), (error) => ({ error })),
+      deadline,
+    ])
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
+  if (outcome !== 'deadline') {
+    if (outcome.error) throw outcome.error
+    return outcome.value
+  }
+
+  const cancelWait = envDuration('DSH_PLUGIN_STEWARD_CANCEL_WAIT_MS', UPDATE_CANCEL_WAIT_MS)
+  let cancelled = false
+  if (!settled && typeof manager.cancelInstall === 'function') {
+    try {
+      const result = await withTimeout(manager.cancelInstall(requestId), cancelWait)
+      cancelled = result?.status === 'cancelled'
+    } catch {
+      // Cancellation is best effort; the timeout is still reported.
+    }
+  }
+
+  let late = null
+  try {
+    late = await withTimeout(pending, cancelWait)
+  } catch {
+    // The timeout below is the useful outcome.
+  }
+  if (late !== null && late !== undefined && installSucceeded(late)) return late
+
+  const seconds = Math.round(timeoutMs / 1000)
+  const error = updateProblem(
+    'timeout',
+    cancelled
+      ? `The installation did not finish within ${seconds}s and was cancelled.`
+      : `The installation did not finish within ${seconds}s.`,
+  )
+  error.cancelled = cancelled
+  throw error
+}
+
+/** Put the version the user had before the update back on disk. */
+async function restoreOldVersion(ctx, name, fromVersion, rollbackSpecs, installArgs, registries, stages) {
+  let current = null
+  try {
+    current = await findInstalledBundle(ctx, name)
+  } catch {
+    // Fall through to the reinstall attempts.
+  }
+  if (current?.installed === true && current.version === fromVersion) {
+    return { restored: true, change: null }
+  }
+
+  let lastError = null
+  for (let index = 0; index < rollbackSpecs.length; index += 1) {
+    const prefix = index === 0 ? 'rollback' : `rollback-${index + 1}`
+    const attempt = await installVersion(ctx, rollbackSpecs[index], installArgs, registries, stages, prefix)
+    if (attempt.change !== null && installSucceeded(attempt.change)) {
+      try {
+        const after = await findInstalledBundle(ctx, name)
+        if (after?.installed === true && after.version === fromVersion) {
+          return { restored: true, change: attempt.change }
+        }
+      } catch {
+        // The version check below reports the mismatch.
+      }
+      lastError = 'The reinstalled version did not match the old version.'
+    } else {
+      lastError = attempt.error
+        ? messageOf(attempt.error)
+        : (attempt.change ? changeReason(attempt.change) : 'The old version could not be reinstalled.')
+    }
+  }
+  return { restored: false, change: null, error: lastError || 'The old version could not be reinstalled.' }
+}
+
+/**
+ * Registries to ask, most likely first. Public candidates are probed for the
+ * exact tarball before the old version is removed; a private registry is
+ * asked alone so its package names never reach a public fallback.
+ */
+async function planInstallRegistries(ctx, name, version, info) {
+  const configured = await registryConfig(ctx)
+  const candidates = []
+  const add = (value) => {
+    if (typeof value !== 'string') return
+    const normalized = normalizeRegistryUrl(value)
+    if (!/^https?:\/\/\S+/.test(normalized)) return
+    if (!candidates.includes(normalized)) candidates.push(normalized)
+  }
+
+  if (typeof info.registry === 'string') add(info.registry)
+  for (const fallback of configured.fallbacks) add(fallback)
+  add('https://registry.npmjs.org/')
+
+  if (candidates.length === 0) return []
+  if (!isPublicRegistryUrl(candidates[0])) return [candidates[0]]
+
+  // Probe in the configured order and stop at the first registry that can
+  // serve the exact tarball. The candidates after it stay as fallbacks, so a
+  // second working registry does not cost another probe up front.
+  const ordered = []
+  const unprobed = []
+  for (let index = 0; index < candidates.length; index += 1) {
+    const registry = candidates[index]
+    const state = await preflightRegistry(registry, name, version)
+    if (state === 'ok') {
+      ordered.push(registry)
+      unprobed.push(...candidates.slice(index + 1))
+      break
+    }
+    if (state === 'unknown' && !isPublicRegistryUrl(registry)) unprobed.push(registry)
+  }
+
+  if (ordered.length > 0) return [...ordered, ...unprobed]
+  return unprobed.filter((registry) => !isPublicRegistryUrl(registry))
+}
+
+async function registryConfig(ctx) {
+  const fallbacks = []
+  let resolved = null
+  try {
+    const info = await ctx.pluginManager.registries()
+    if (typeof info?.resolved === 'string' && /^https?:\/\//i.test(info.resolved)) resolved = info.resolved
+    for (const fallback of Array.isArray(info?.fallbackRegistries) ? info.fallbackRegistries : []) {
+      if (typeof fallback === 'string' && /^https?:\/\//i.test(fallback)) fallbacks.push(fallback)
+    }
+  } catch {
+    // The default public registry remains a useful last resort.
+  }
+  return { resolved, fallbacks }
+}
+
+/**
+ * Ask a registry for the exact tarball URL and check that the file answers.
+ * 'unknown' is kept for registries whose metadata needs credentials; a public
+ * registry that does not answer is skipped by the caller.
+ */
+async function preflightRegistry(registry, name, version) {
+  let tarball = null
+  try {
+    const packument = await fetchJson(
+      `${registry.replace(/\/+$/, '')}/${encodeURIComponent(name)}`,
+      'application/vnd.npm.install-v1+json',
+      envDuration('DSH_PLUGIN_STEWARD_PREFLIGHT_TIMEOUT_MS', UPDATE_PREFLIGHT_TIMEOUT_MS),
+    )
+    const dist = packument?.versions?.[version]?.dist
+    tarball = typeof dist?.tarball === 'string' && /^https?:\/\//i.test(dist.tarball)
+      ? dist.tarball
+      : null
+  } catch {
+    return isPublicRegistryUrl(registry) ? 'unreachable' : 'unknown'
+  }
+  if (tarball === null) return isPublicRegistryUrl(registry) ? 'unreachable' : 'unknown'
+
+  const controller = new AbortController()
+  const timer = setTimeout(
+    () => controller.abort(),
+    envDuration('DSH_PLUGIN_STEWARD_PREFLIGHT_TIMEOUT_MS', UPDATE_PREFLIGHT_TIMEOUT_MS),
+  )
+  if (typeof timer.unref === 'function') timer.unref()
+  try {
+    const response = await fetch(tarball, {
+      method: 'HEAD',
+      redirect: 'follow',
+      signal: controller.signal,
+    })
+    if (response.ok || response.status === 405) return 'ok'
+    // 401/403 mean the host answered and pnpm can still authenticate.
+    if (response.status === 401 || response.status === 403) return 'ok'
+    return 'unreachable'
+  } catch {
+    return 'unreachable'
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function normalizeRegistryUrl(value) {
+  return `${String(value).trim().replace(/\/+$/, '')}/`
+}
+
+function isPublicRegistryUrl(value) {
+  return typeof value === 'string' && PUBLIC_REGISTRIES.has(normalizeRegistryUrl(value))
+}
+
+function newRequestId() {
+  return `steward-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function envDuration(name, fallback) {
+  const value = Number(process.env[name])
+  return Number.isFinite(value) && value >= 1000 ? value : fallback
+}
+
+function withTimeout(promise, ms) {
+  let timer = null
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== null) clearTimeout(timer)
+  })
+}
+
+function journalTarget(ctx) {
+  const candidates = []
+  try {
+    const profile = typeof ctx?.get === 'function' ? ctx.get('profileContext') : undefined
+    if (typeof profile?.dir === 'string') candidates.push(profile.dir)
+  } catch {
+    // Fall through to the other sources.
+  }
+  try {
+    if (typeof ctx?.pluginManager?.profile?.dir === 'string') candidates.push(ctx.pluginManager.profile.dir)
+  } catch {
+    // Fall through to the environment.
+  }
+  if (typeof process.env.DSH_PROFILE_DIR === 'string') candidates.push(process.env.DSH_PROFILE_DIR)
+  const dir = candidates.find((value) => typeof value === 'string' && value !== '')
+  if (dir === undefined) return null
+  return join(dir, '.plugin-manager', JOURNAL_FILE)
+}
+
+async function writeJournal(ctx, record) {
+  const target = journalTarget(ctx)
+  if (target === null) return true
+  const temp = `${target}.${process.pid}.tmp`
+  try {
+    await mkdir(dirname(target), { recursive: true })
+    await writeFile(temp, JSON.stringify(record, null, 2), 'utf8')
+    await rename(temp, target)
+    return true
+  } catch (error) {
+    try {
+      ctx.logger?.warn?.('dsh-plugin-steward: could not write the update journal', error)
+    } catch {
+      // Reporting the failure must not fail the update itself.
+    }
+    return false
+  }
+}
+
+async function readJournal(ctx) {
+  const target = journalTarget(ctx)
+  if (target === null) return null
+  try {
+    const record = JSON.parse(await readFile(target, 'utf8'))
+    if (record === null || typeof record !== 'object') return null
+    if (record.version !== JOURNAL_VERSION) return null
+    if (typeof record.name !== 'string' || typeof record.fromVersion !== 'string') return null
+    return record
+  } catch {
+    return null
+  }
+}
+
+async function clearJournal(ctx) {
+  const target = journalTarget(ctx)
+  if (target === null) return
+  try {
+    await rm(target, { force: true })
+  } catch {
+    // A leftover journal is harmless: the next start verifies the profile first.
   }
 }
 
@@ -529,6 +1019,7 @@ async function computeUpdates(ctx) {
     checkedAt: Date.now(),
     registries,
     github: { authenticated: github.token !== null },
+    steward: { version: STEWARD_VERSION },
     packages,
   }
 }
@@ -788,7 +1279,7 @@ function githubAccess() {
 async function githubJson(path, github) {
   const headers = {
     accept: 'application/vnd.github+json',
-    'user-agent': 'dsh-plugin-steward/1.2.0',
+    'user-agent': 'dsh-plugin-steward/1.2.1',
   }
   if (github && github.token !== null) headers.authorization = `Bearer ${github.token}`
   const response = await fetch(`${GITHUB_API}${path}`, {
@@ -826,7 +1317,7 @@ async function registryUrls(ctx) {
   if (primary !== null) {
     add(primary)
     const normalized = primary.trim().replace(/\/+$/, '')
-    if (!PUBLIC_REGISTRIES.has(normalized)) return urls
+    if (!isPublicRegistryUrl(normalized)) return urls
     for (const fallback of Array.isArray(info?.fallbackRegistries) ? info.fallbackRegistries : []) {
       add(fallback)
     }
@@ -857,13 +1348,13 @@ async function readLatest(registry, name) {
   return typeof latest === 'string' && latest !== '' ? latest : null
 }
 
-async function fetchJson(url, accept = 'application/json') {
+async function fetchJson(url, accept = 'application/json', timeoutMs = FETCH_TIMEOUT_MS) {
   const response = await fetch(url, {
     headers: {
       accept,
-      'user-agent': 'dsh-plugin-steward/1.0.0',
+      'user-agent': 'dsh-plugin-steward/1.2.1',
     },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   return await response.json()

@@ -30,17 +30,27 @@ A DSH Web plugin that adds a **Plugin Steward** tab to the running Plugins page.
 The update flow is:
 
 1. Confirm from the update cache that the selected version is still `latest`.
-2. Remove the old bundle.
-3. Install the exact new version, preserving the previous enabled state.
-4. Verify the installed version.
-5. If any step fails:
-   - try to remove the failed new version;
-   - reinstall the old version;
-   - return `rolled-back` or `rollback-failed`.
+2. For registry packages, probe the exact tarball on each candidate registry before touching
+   the profile. If no registry can serve it, fail with `network` and leave the old version
+   installed.
+3. Write a recovery journal (`.plugin-manager/steward-pending-update.json`).
+4. Remove the old bundle.
+5. Install the exact new version, preserving the previous enabled state. Each registry gets a
+   bounded attempt; a stalled run is cancelled through the plugin manager instead of waiting
+   for its ten-minute silence timeout.
+6. Verify the installed version and clear the journal.
+7. If any step fails:
+   - if the old version is still installed, return `failed` with `keptVersion`;
+   - otherwise reinstall the old version and return `rolled-back`;
+   - if the reinstall also fails, keep the journal and return `rollback-failed`.
 
-Every result is one of `updated`, `restart-required`, `rolled-back`, or `rollback-failed`.
-A failed rollback reports the old version and requires a manual reinstall from the official
-Plugins page.
+Every result is one of `updated`, `restart-required`, `failed`, `rolled-back`, or
+`rollback-failed`. A failed rollback reports the old version and requires a manual reinstall
+from the official Plugins page.
+
+If the process exits between removal and installation, the next start reads the journal and
+reinstalls the previous version automatically before offering another update. The journal is
+kept for seven days and is cleared once the profile is back in a known-good state.
 
 A removal that DSH reports as `restart-required` is a deferred success, not a failure: the
 new version is still installed, and the result is `restart-required`. The running process
@@ -52,8 +62,9 @@ returned by the update service, the rollback status, and optional stage diagnost
 reason can be copied for a bug report. Failed results include a top-level `reason`, a
 `failure` object with the original error, and `rollbackReason` when rollback failed.
 
-> Updates use the official plugin manager's remove-then-install flow. After a successful
-> update, the bundle rejoins the end of the profile bundle list, which can change
+> Updates use the official plugin manager's remove-then-install flow because a live profile
+> with HMR refuses to install over an existing dependency (`already-installed`). After a
+> successful update, the bundle rejoins the end of the profile bundle list, which can change
 > configuration precedence.
 
 ## Update sources
@@ -79,9 +90,10 @@ The browser half uses the generated `pluginManager` Remote namespace for invento
 enablement. The Host half adds two same-origin routes:
 
 - `GET /dsh-plugin-steward/updates` — cached npm/GitHub Release comparison with a ten-minute
-  TTL.
-- `POST /dsh-plugin-steward/update` — removes the old bundle, installs the exact npm or
-  GitHub Release target, verifies it, and rolls back on failure.
+  TTL; includes a `steward.version` field for diagnostics.
+- `POST /dsh-plugin-steward/update` — preflights the target tarball, writes the recovery
+  journal, removes the old bundle, installs the exact npm or GitHub Release target with
+  bounded registry attempts, verifies it, and restores the old version on failure.
 
 The update route requires:
 
